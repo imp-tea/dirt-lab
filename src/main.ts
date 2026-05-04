@@ -1,4 +1,5 @@
 import './style.css'
+import { Body, Box, Chain, Circle, Vec2, WheelJoint, World } from 'planck'
 
 const GRID_WIDTH = 180
 const GRID_HEIGHT = 110
@@ -22,8 +23,22 @@ const STRESS_LINE_MAX_PATH_STEPS = GRID_WIDTH + GRID_HEIGHT
 const MAX_STRESS_FRACTURE_REPASSES = 3
 const UNSUPPORTED_DISTANCE = 65535
 const STRESS_INTERVAL_TICKS = 4
+const POLYGON_REBUILD_INTERVAL_TICKS = 6
+const CONTOUR_REBUILD_INTERVAL_TICKS = 6
+const CONTOUR_SIMPLIFY_EPSILON = 0.65
+const CONTOUR_SMOOTHING_PASSES = 2
+const CONTOUR_NOISE_NEIGHBOR_THRESHOLD = 3
+const PHYSICS_STEP_SECONDS = 1 / 60
+const VEHICLE_START_COL = 64
+const VEHICLE_START_ROW = 70
+const VEHICLE_MOTOR_SPEED = 18
+const VEHICLE_MOTOR_TORQUE = 850
 
 type Tool = 'loose' | 'packed' | 'erase'
+type Point = { x: number; y: number }
+type PackedPolygon = Point[]
+type PackedContour = Point[]
+type ContourSegment = { start: Point; end: Point }
 
 const app = document.querySelector<HTMLDivElement>('#app')
 
@@ -100,6 +115,16 @@ app.innerHTML = `
         <input id="stress-fractures" type="checkbox" checked />
       </label>
 
+      <label class="toggle-row" for="packed-polygons">
+        <span>Packed polygons</span>
+        <input id="packed-polygons" type="checkbox" />
+      </label>
+
+      <label class="toggle-row" for="packed-contours">
+        <span>Packed contours</span>
+        <input id="packed-contours" type="checkbox" />
+      </label>
+
       <pre id="inspector" class="inspector" aria-live="polite">Inspector off</pre>
 
       <div class="legend" aria-label="Materials">
@@ -123,6 +148,8 @@ const dampingValueEl = document.querySelector<HTMLSpanElement>('#damping-value')
 const strengthValueEl = document.querySelector<HTMLSpanElement>('#strength-value')!
 const debugInput = document.querySelector<HTMLInputElement>('#debug-inspector')!
 const stressInput = document.querySelector<HTMLInputElement>('#stress-fractures')!
+const polygonInput = document.querySelector<HTMLInputElement>('#packed-polygons')!
+const contourInput = document.querySelector<HTMLInputElement>('#packed-contours')!
 const inspectorEl = document.querySelector<HTMLPreElement>('#inspector')!
 const pauseButton = document.querySelector<HTMLButtonElement>('#pause')!
 const stepButton = document.querySelector<HTMLButtonElement>('#step')!
@@ -148,6 +175,7 @@ const supportDistance = new Uint16Array(MAX_PARTICLES + 1)
 const stressLineNext = new Int32Array(MAX_PARTICLES + 1)
 const carriedLoad = new Float32Array(MAX_PARTICLES + 1)
 const stress = new Float32Array(MAX_PARTICLES + 1)
+const polygonVisited = new Uint8Array(MAX_PARTICLES)
 const activeIds: number[] = []
 const freeIds: number[] = []
 
@@ -162,11 +190,32 @@ let isPainting = false
 let isPaused = false
 let isInspectorEnabled = false
 let isStressEnabled = true
+let isPolygonDebugEnabled = false
+let isContourDebugEnabled = false
+let isDrivingLeft = false
+let isDrivingRight = false
 let hoverCol = -1
 let hoverRow = -1
 let lastFrame = performance.now()
 let fps = 0
 let simAccumulator = 0
+let physicsAccumulator = 0
+let packedPolygonCacheTick = -POLYGON_REBUILD_INTERVAL_TICKS
+let isPackedPolygonCacheDirty = true
+let packedPolygons: PackedPolygon[] = []
+let packedContourCacheTick = -CONTOUR_REBUILD_INTERVAL_TICKS
+let isPackedContourCacheDirty = true
+let packedContours: PackedContour[] = []
+let physicsTerrainBody: Body | null = null
+let physicsChassisBody: Body | null = null
+let physicsLeftWheelBody: Body | null = null
+let physicsRightWheelBody: Body | null = null
+let physicsLeftWheelJoint: WheelJoint | null = null
+let physicsRightWheelJoint: WheelJoint | null = null
+
+const physicsWorld = new World({
+  gravity: Vec2(0, 32),
+})
 
 supportDistance.fill(UNSUPPORTED_DISTANCE)
 
@@ -220,6 +269,10 @@ function addParticle(col: number, row: number, particleKind: number) {
   stress[id] = 0
   grid[indexAt(col, row)] = id
   activeIds.push(id)
+  if (particleKind === PACKED_DIRT) {
+    isPackedPolygonCacheDirty = true
+    isPackedContourCacheDirty = true
+  }
   return id
 }
 
@@ -236,6 +289,8 @@ function removeParticle(id: number) {
   stressLineNext[id] = 0
   carriedLoad[id] = 0
   stress[id] = 0
+  isPackedPolygonCacheDirty = true
+  isPackedContourCacheDirty = true
   freeIds.push(id)
 }
 
@@ -249,6 +304,7 @@ function moveParticle(id: number, col: number, row: number) {
 }
 
 function setLoose(id: number) {
+  const wasPacked = kind[id] === PACKED_DIRT
   kind[id] = LOOSE_DIRT
   mass[id] = 1
   stickiness[id] = 1
@@ -259,9 +315,14 @@ function setLoose(id: number) {
   stressLineNext[id] = 0
   carriedLoad[id] = 0
   stress[id] = 0
+  if (wasPacked) {
+    isPackedPolygonCacheDirty = true
+    isPackedContourCacheDirty = true
+  }
 }
 
 function setPacked(id: number) {
+  const wasPacked = kind[id] === PACKED_DIRT
   kind[id] = PACKED_DIRT
   mass[id] = 3
   stickiness[id] = 2
@@ -269,6 +330,10 @@ function setPacked(id: number) {
   restTicks[id] = 0
   vx[id] = 0
   vy[id] = 0
+  if (!wasPacked) {
+    isPackedPolygonCacheDirty = true
+    isPackedContourCacheDirty = true
+  }
 }
 
 function updatePackedStrengths() {
@@ -648,6 +713,501 @@ function updatePackedStress() {
   recalculatePackedStress()
 }
 
+function isPackedCell(col: number, row: number) {
+  if (!inBounds(col, row)) return false
+  const id = grid[indexAt(col, row)]
+  return id > 0 && kind[id] === PACKED_DIRT
+}
+
+function isUncoveredPackedCell(col: number, row: number) {
+  if (!isPackedCell(col, row)) return false
+  return polygonVisited[indexAt(col, row)] === 0
+}
+
+function rectanglePolygon(col: number, row: number, width: number, height: number): PackedPolygon {
+  return [
+    { x: col, y: row },
+    { x: col + width, y: row },
+    { x: col + width, y: row + height },
+    { x: col, y: row + height },
+  ]
+}
+
+function measurePackedRectangleWidth(col: number, row: number) {
+  let width = 0
+  while (col + width < GRID_WIDTH && isUncoveredPackedCell(col + width, row)) {
+    width += 1
+  }
+
+  return width
+}
+
+function canExtendPackedRectangle(col: number, row: number, width: number) {
+  if (row >= GRID_HEIGHT) return false
+
+  for (let offset = 0; offset < width; offset += 1) {
+    if (!isUncoveredPackedCell(col + offset, row)) return false
+  }
+
+  return true
+}
+
+function markPackedRectangleCovered(col: number, row: number, width: number, height: number) {
+  for (let fillRow = row; fillRow < row + height; fillRow += 1) {
+    for (let fillCol = col; fillCol < col + width; fillCol += 1) {
+      polygonVisited[indexAt(fillCol, fillRow)] = 1
+    }
+  }
+}
+
+function rebuildPackedPolygons() {
+  packedPolygons = []
+  polygonVisited.fill(0)
+
+  for (let row = 0; row < GRID_HEIGHT; row += 1) {
+    for (let col = 0; col < GRID_WIDTH; col += 1) {
+      if (!isUncoveredPackedCell(col, row)) continue
+
+      const width = measurePackedRectangleWidth(col, row)
+      let height = 1
+      while (canExtendPackedRectangle(col, row + height, width)) {
+        height += 1
+      }
+
+      markPackedRectangleCovered(col, row, width, height)
+      packedPolygons.push(rectanglePolygon(col, row, width, height))
+    }
+  }
+
+  packedPolygonCacheTick = tick
+  isPackedPolygonCacheDirty = false
+}
+
+function updatePackedPolygonCache() {
+  if (!isPolygonDebugEnabled) return
+  if (!isPackedPolygonCacheDirty && tick - packedPolygonCacheTick < POLYGON_REBUILD_INTERVAL_TICKS) return
+  rebuildPackedPolygons()
+}
+
+function drawPackedPolygonOverlay() {
+  if (!isPolygonDebugEnabled) return
+
+  updatePackedPolygonCache()
+
+  ctx.save()
+  ctx.globalAlpha = 0.5
+  ctx.fillStyle = '#3bb9d8'
+  ctx.strokeStyle = '#d8fbff'
+  ctx.lineWidth = 1
+
+  for (const polygon of packedPolygons) {
+    if (polygon.length < 3) continue
+    ctx.beginPath()
+    ctx.moveTo(polygon[0].x * CELL_SIZE, polygon[0].y * CELL_SIZE)
+    for (let i = 1; i < polygon.length; i += 1) {
+      ctx.lineTo(polygon[i].x * CELL_SIZE, polygon[i].y * CELL_SIZE)
+    }
+    ctx.closePath()
+    ctx.fill()
+    ctx.stroke()
+  }
+
+  ctx.restore()
+}
+
+function pointKey(point: Point) {
+  return `${point.x},${point.y}`
+}
+
+function addContourEdge(segments: ContourSegment[], start: Point, end: Point) {
+  segments.push({ start, end })
+}
+
+function countRawPackedNeighbors(col: number, row: number) {
+  let count = 0
+  if (isPackedCell(col + 1, row)) count += 1
+  if (isPackedCell(col - 1, row)) count += 1
+  if (isPackedCell(col, row + 1)) count += 1
+  if (isPackedCell(col, row - 1)) count += 1
+  return count
+}
+
+function isContourSolidCell(col: number, row: number) {
+  if (!inBounds(col, row)) return false
+
+  const packedNeighbors = countRawPackedNeighbors(col, row)
+  if (isPackedCell(col, row)) {
+    const emptyNeighbors = 4 - packedNeighbors
+    return emptyNeighbors < CONTOUR_NOISE_NEIGHBOR_THRESHOLD
+  }
+
+  return packedNeighbors >= CONTOUR_NOISE_NEIGHBOR_THRESHOLD
+}
+
+function collectPackedContourSegments() {
+  const segments: ContourSegment[] = []
+
+  for (let row = 0; row < GRID_HEIGHT; row += 1) {
+    for (let col = 0; col < GRID_WIDTH; col += 1) {
+      if (!isContourSolidCell(col, row)) continue
+
+      if (!isContourSolidCell(col, row - 1)) {
+        addContourEdge(segments, { x: col, y: row }, { x: col + 1, y: row })
+      }
+      if (!isContourSolidCell(col + 1, row)) {
+        addContourEdge(segments, { x: col + 1, y: row }, { x: col + 1, y: row + 1 })
+      }
+      if (!isContourSolidCell(col, row + 1)) {
+        addContourEdge(segments, { x: col + 1, y: row + 1 }, { x: col, y: row + 1 })
+      }
+      if (!isContourSolidCell(col - 1, row)) {
+        addContourEdge(segments, { x: col, y: row + 1 }, { x: col, y: row })
+      }
+    }
+  }
+
+  return segments
+}
+
+function stitchContourSegments(segments: ContourSegment[]) {
+  const contours: PackedContour[] = []
+  const starts = new Map<string, number[]>()
+  const used = new Uint8Array(segments.length)
+
+  for (let i = 0; i < segments.length; i += 1) {
+    const key = pointKey(segments[i].start)
+    const entries = starts.get(key)
+    if (entries) entries.push(i)
+    else starts.set(key, [i])
+  }
+
+  for (let i = 0; i < segments.length; i += 1) {
+    if (used[i] === 1) continue
+
+    const contour: PackedContour = [segments[i].start, segments[i].end]
+    used[i] = 1
+
+    while (contour.length < segments.length + 1) {
+      const first = contour[0]
+      const current = contour[contour.length - 1]
+      if (current.x === first.x && current.y === first.y) break
+
+      const candidates = starts.get(pointKey(current))
+      const next = candidates?.find((candidate) => used[candidate] === 0)
+      if (next === undefined) break
+
+      used[next] = 1
+      contour.push(segments[next].end)
+    }
+
+    if (contour.length >= 4) {
+      if (pointKey(contour[0]) === pointKey(contour[contour.length - 1])) contour.pop()
+      contours.push(contour)
+    }
+  }
+
+  return contours
+}
+
+function squaredDistanceToSegment(point: Point, start: Point, end: Point) {
+  const dx = end.x - start.x
+  const dy = end.y - start.y
+  const lengthSquared = dx * dx + dy * dy
+
+  if (lengthSquared === 0) {
+    const pointDx = point.x - start.x
+    const pointDy = point.y - start.y
+    return pointDx * pointDx + pointDy * pointDy
+  }
+
+  const t = Math.max(0, Math.min(1, ((point.x - start.x) * dx + (point.y - start.y) * dy) / lengthSquared))
+  const projectionX = start.x + t * dx
+  const projectionY = start.y + t * dy
+  const pointDx = point.x - projectionX
+  const pointDy = point.y - projectionY
+  return pointDx * pointDx + pointDy * pointDy
+}
+
+function simplifyOpenContour(points: PackedContour, epsilon: number): PackedContour {
+  if (points.length <= 2) return points.slice()
+
+  let farthestIndex = -1
+  let farthestDistance = 0
+  const start = points[0]
+  const end = points[points.length - 1]
+
+  for (let i = 1; i < points.length - 1; i += 1) {
+    const distance = squaredDistanceToSegment(points[i], start, end)
+    if (distance > farthestDistance) {
+      farthestDistance = distance
+      farthestIndex = i
+    }
+  }
+
+  if (farthestDistance <= epsilon * epsilon || farthestIndex === -1) return [start, end]
+
+  const left = simplifyOpenContour(points.slice(0, farthestIndex + 1), epsilon)
+  const right = simplifyOpenContour(points.slice(farthestIndex), epsilon)
+  return left.slice(0, -1).concat(right)
+}
+
+function simplifyClosedContour(contour: PackedContour, epsilon: number) {
+  if (contour.length <= 4) return contour.slice()
+
+  let splitIndex = 0
+  for (let i = 1; i < contour.length; i += 1) {
+    if (contour[i].x < contour[splitIndex].x || (contour[i].x === contour[splitIndex].x && contour[i].y < contour[splitIndex].y)) {
+      splitIndex = i
+    }
+  }
+
+  const rotated = contour.slice(splitIndex).concat(contour.slice(0, splitIndex), [contour[splitIndex]])
+  const simplified = simplifyOpenContour(rotated, epsilon)
+  if (pointKey(simplified[0]) === pointKey(simplified[simplified.length - 1])) simplified.pop()
+  return simplified.length >= 3 ? simplified : contour.slice()
+}
+
+function smoothClosedContour(contour: PackedContour, passes: number) {
+  let smoothed = contour.slice()
+
+  for (let pass = 0; pass < passes; pass += 1) {
+    if (smoothed.length < 3) break
+
+    const next: PackedContour = []
+    for (let i = 0; i < smoothed.length; i += 1) {
+      const a = smoothed[i]
+      const b = smoothed[(i + 1) % smoothed.length]
+      next.push({
+        x: a.x * 0.75 + b.x * 0.25,
+        y: a.y * 0.75 + b.y * 0.25,
+      })
+      next.push({
+        x: a.x * 0.25 + b.x * 0.75,
+        y: a.y * 0.25 + b.y * 0.75,
+      })
+    }
+
+    smoothed = next
+  }
+
+  return smoothed
+}
+
+function rebuildPackedContours() {
+  const segments = collectPackedContourSegments()
+  const contours = stitchContourSegments(segments)
+  packedContours = contours.map((contour) => smoothClosedContour(simplifyClosedContour(contour, CONTOUR_SIMPLIFY_EPSILON), CONTOUR_SMOOTHING_PASSES))
+  packedContourCacheTick = tick
+  isPackedContourCacheDirty = false
+}
+
+function updatePackedContourCache() {
+  if (!isContourDebugEnabled) return
+  if (!isPackedContourCacheDirty && tick - packedContourCacheTick < CONTOUR_REBUILD_INTERVAL_TICKS) return
+  rebuildPackedContours()
+}
+
+function drawPackedContourOverlay() {
+  if (!isContourDebugEnabled) return
+
+  updatePackedContourCache()
+
+  ctx.save()
+  ctx.globalAlpha = 0.9
+  ctx.strokeStyle = '#66f2a5'
+  ctx.lineWidth = 2
+  ctx.lineJoin = 'round'
+  ctx.lineCap = 'round'
+
+  for (const contour of packedContours) {
+    if (contour.length < 3) continue
+    ctx.beginPath()
+    ctx.moveTo(contour[0].x * CELL_SIZE, contour[0].y * CELL_SIZE)
+    for (let i = 1; i < contour.length; i += 1) {
+      ctx.lineTo(contour[i].x * CELL_SIZE, contour[i].y * CELL_SIZE)
+    }
+    ctx.closePath()
+    ctx.stroke()
+  }
+
+  ctx.restore()
+}
+
+function rebuildPhysicsTerrain() {
+  if (!isPackedContourCacheDirty && tick - packedContourCacheTick < CONTOUR_REBUILD_INTERVAL_TICKS) return
+
+  rebuildPackedContours()
+
+  if (physicsTerrainBody) physicsWorld.destroyBody(physicsTerrainBody)
+  physicsTerrainBody = physicsWorld.createBody()
+
+  for (const contour of packedContours) {
+    if (contour.length < 3) continue
+
+    const vertices = contour.map((point) => Vec2(point.x, point.y))
+    physicsTerrainBody.createFixture({
+      shape: Chain(vertices, true),
+      friction: 1.4,
+      restitution: 0,
+    })
+  }
+}
+
+function destroyVehicleBody(body: Body | null) {
+  if (body) physicsWorld.destroyBody(body)
+}
+
+function resetPhysicsVehicle() {
+  destroyVehicleBody(physicsChassisBody)
+  destroyVehicleBody(physicsLeftWheelBody)
+  destroyVehicleBody(physicsRightWheelBody)
+
+  physicsChassisBody = physicsWorld.createDynamicBody({
+    position: Vec2(VEHICLE_START_COL, VEHICLE_START_ROW),
+    angularDamping: 1.2,
+    linearDamping: 0.08,
+  })
+  physicsChassisBody.createFixture({
+    shape: Box(5.8, 1.15),
+    density: 0.65,
+    friction: 0.6,
+    restitution: 0.05,
+  })
+
+  physicsLeftWheelBody = physicsWorld.createDynamicBody({
+    position: Vec2(VEHICLE_START_COL - 4.2, VEHICLE_START_ROW + 2.2),
+    angularDamping: 0.15,
+  })
+  physicsLeftWheelBody.createFixture({
+    shape: Circle(1.75),
+    density: 1.35,
+    friction: 2.8,
+    restitution: 0.02,
+  })
+
+  physicsRightWheelBody = physicsWorld.createDynamicBody({
+    position: Vec2(VEHICLE_START_COL + 4.2, VEHICLE_START_ROW + 2.2),
+    angularDamping: 0.15,
+  })
+  physicsRightWheelBody.createFixture({
+    shape: Circle(1.75),
+    density: 1.35,
+    friction: 2.8,
+    restitution: 0.02,
+  })
+
+  const jointOptions = {
+    enableMotor: true,
+    maxMotorTorque: VEHICLE_MOTOR_TORQUE,
+    motorSpeed: 0,
+    frequencyHz: 4,
+    dampingRatio: 0.75,
+  }
+
+  physicsLeftWheelJoint = physicsWorld.createJoint(WheelJoint(
+    jointOptions,
+    physicsChassisBody,
+    physicsLeftWheelBody,
+    physicsLeftWheelBody.getPosition(),
+    Vec2(0, 1),
+  ))
+  physicsRightWheelJoint = physicsWorld.createJoint(WheelJoint(
+    jointOptions,
+    physicsChassisBody,
+    physicsRightWheelBody,
+    physicsRightWheelBody.getPosition(),
+    Vec2(0, 1),
+  ))
+}
+
+function updateVehicleMotor() {
+  const drive = Number(isDrivingRight) - Number(isDrivingLeft)
+  const motorSpeed = -drive * VEHICLE_MOTOR_SPEED
+
+  physicsLeftWheelJoint?.setMotorSpeed(motorSpeed)
+  physicsRightWheelJoint?.setMotorSpeed(motorSpeed)
+}
+
+function stepPhysics(delta: number) {
+  rebuildPhysicsTerrain()
+  updateVehicleMotor()
+
+  physicsAccumulator += delta / 1000
+  let iterations = 0
+  while (physicsAccumulator >= PHYSICS_STEP_SECONDS && iterations < 5) {
+    physicsWorld.step(PHYSICS_STEP_SECONDS, 8, 3)
+    physicsAccumulator -= PHYSICS_STEP_SECONDS
+    iterations += 1
+  }
+
+  if (physicsChassisBody && physicsChassisBody.getPosition().y > GRID_HEIGHT + 35) {
+    resetPhysicsVehicle()
+  }
+}
+
+function drawPhysicsBox(body: Body, halfWidth: number, halfHeight: number, fillStyle: string, strokeStyle: string) {
+  const position = body.getPosition()
+  const angle = body.getAngle()
+  const cos = Math.cos(angle)
+  const sin = Math.sin(angle)
+  const corners = [
+    [-halfWidth, -halfHeight],
+    [halfWidth, -halfHeight],
+    [halfWidth, halfHeight],
+    [-halfWidth, halfHeight],
+  ]
+
+  ctx.beginPath()
+  for (let i = 0; i < corners.length; i += 1) {
+    const [localX, localY] = corners[i]
+    const worldX = position.x + localX * cos - localY * sin
+    const worldY = position.y + localX * sin + localY * cos
+    const canvasX = worldX * CELL_SIZE
+    const canvasY = worldY * CELL_SIZE
+    if (i === 0) ctx.moveTo(canvasX, canvasY)
+    else ctx.lineTo(canvasX, canvasY)
+  }
+  ctx.closePath()
+  ctx.fillStyle = fillStyle
+  ctx.strokeStyle = strokeStyle
+  ctx.lineWidth = 2
+  ctx.fill()
+  ctx.stroke()
+}
+
+function drawPhysicsWheel(body: Body, radius: number) {
+  const position = body.getPosition()
+  const angle = body.getAngle()
+  const canvasX = position.x * CELL_SIZE
+  const canvasY = position.y * CELL_SIZE
+  const canvasRadius = radius * CELL_SIZE
+
+  ctx.beginPath()
+  ctx.arc(canvasX, canvasY, canvasRadius, 0, Math.PI * 2)
+  ctx.fillStyle = '#181c21'
+  ctx.strokeStyle = '#f3d173'
+  ctx.lineWidth = 2
+  ctx.fill()
+  ctx.stroke()
+
+  ctx.beginPath()
+  ctx.moveTo(canvasX, canvasY)
+  ctx.lineTo(canvasX + Math.cos(angle) * canvasRadius, canvasY + Math.sin(angle) * canvasRadius)
+  ctx.strokeStyle = '#f8f1dc'
+  ctx.lineWidth = 1.5
+  ctx.stroke()
+}
+
+function drawPhysicsVehicle() {
+  if (!physicsChassisBody || !physicsLeftWheelBody || !physicsRightWheelBody) return
+
+  ctx.save()
+  drawPhysicsBox(physicsChassisBody, 5.8, 1.15, '#d9563f', '#ffe0a3')
+  drawPhysicsWheel(physicsLeftWheelBody, 1.75)
+  drawPhysicsWheel(physicsRightWheelBody, 1.75)
+  ctx.restore()
+}
+
 function compactActiveList() {
   let write = 0
   for (let read = 0; read < activeIds.length; read += 1) {
@@ -699,6 +1259,10 @@ function drawGrid() {
       ctx.fillRect(col * CELL_SIZE, row * CELL_SIZE, CELL_SIZE, CELL_SIZE)
     }
   }
+
+  drawPackedPolygonOverlay()
+  drawPackedContourOverlay()
+  drawPhysicsVehicle()
 
   if (isInspectorEnabled && inBounds(hoverCol, hoverRow)) {
     ctx.strokeStyle = '#f2d8a4'
@@ -788,6 +1352,7 @@ function frame(now: number) {
       iterations += 1
     }
   }
+  stepPhysics(delta)
   drawGrid()
   updateInspector()
   updateStats(delta)
@@ -883,6 +1448,40 @@ stressInput.addEventListener('change', () => {
   }
 })
 
+polygonInput.addEventListener('change', () => {
+  isPolygonDebugEnabled = polygonInput.checked
+  isPackedPolygonCacheDirty = true
+})
+
+contourInput.addEventListener('change', () => {
+  isContourDebugEnabled = contourInput.checked
+  isPackedContourCacheDirty = true
+})
+
+window.addEventListener('keydown', (event) => {
+  if (event.repeat) return
+  if (event.code === 'KeyA') {
+    isDrivingLeft = true
+    event.preventDefault()
+  } else if (event.code === 'KeyD') {
+    isDrivingRight = true
+    event.preventDefault()
+  } else if (event.code === 'KeyR') {
+    resetPhysicsVehicle()
+    event.preventDefault()
+  }
+})
+
+window.addEventListener('keyup', (event) => {
+  if (event.code === 'KeyA') {
+    isDrivingLeft = false
+    event.preventDefault()
+  } else if (event.code === 'KeyD') {
+    isDrivingRight = false
+    event.preventDefault()
+  }
+})
+
 pauseButton.addEventListener('click', () => {
   isPaused = !isPaused
   pauseButton.textContent = isPaused ? 'Run' : 'Pause'
@@ -910,6 +1509,14 @@ clearButton.addEventListener('click', () => {
   activeIds.length = 0
   freeIds.length = 0
   nextId = 1
+  packedPolygons = []
+  packedContours = []
+  isPackedPolygonCacheDirty = true
+  isPackedContourCacheDirty = true
+  rebuildPhysicsTerrain()
+  resetPhysicsVehicle()
 })
 
+rebuildPhysicsTerrain()
+resetPhysicsVehicle()
 requestAnimationFrame(frame)
