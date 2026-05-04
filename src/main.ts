@@ -12,9 +12,14 @@ const GRAVITY = 1
 const DEFAULT_TICKS_PER_SECOND = 28
 const DEFAULT_DAMPING = 0
 const PACK_AFTER_REST_TICKS = 5
-const DEFAULT_PACKED_STRENGTH = 200
-const LOCAL_OVERHANG_STRESS_MULTIPLIER = 5.0
-const SUPPORT_DISTANCE_STRESS_MULTIPLIER = 0.18
+const DEFAULT_PACKED_STRENGTH = 400
+const STRESS_LINE_LOAD_MULTIPLIER = 0.8
+const STRESS_LINE_CARRIED_LOAD_FACTOR = 0.08
+const STRESS_LINE_DISTANCE_MULTIPLIER = 0.28
+const STRESS_LINE_DISTANCE_EXPONENT = 1.2
+const STRESS_LINE_SUPPORT_BIAS = 0.65
+const STRESS_LINE_MAX_PATH_STEPS = GRID_WIDTH + GRID_HEIGHT
+const MAX_STRESS_FRACTURE_REPASSES = 3
 const UNSUPPORTED_DISTANCE = 65535
 const STRESS_INTERVAL_TICKS = 4
 
@@ -71,6 +76,14 @@ app.innerHTML = `
         <input id="damping" type="range" min="0" max="60" value="${DEFAULT_DAMPING}" />
       </div>
 
+      <div class="control-group">
+        <div class="label-row">
+          <label for="strength">Strength</label>
+          <span id="strength-value">${DEFAULT_PACKED_STRENGTH}</span>
+        </div>
+        <input id="strength" type="range" min="20" max="500" step="10" value="${DEFAULT_PACKED_STRENGTH}" />
+      </div>
+
       <div class="button-row">
         <button id="pause" type="button" title="Pause or resume">Pause</button>
         <button id="step" type="button" title="Run one tick">Step</button>
@@ -104,8 +117,10 @@ const countEl = document.querySelector<HTMLSpanElement>('#count')!
 const brushInput = document.querySelector<HTMLInputElement>('#brush')!
 const speedInput = document.querySelector<HTMLInputElement>('#speed')!
 const dampingInput = document.querySelector<HTMLInputElement>('#damping')!
+const strengthInput = document.querySelector<HTMLInputElement>('#strength')!
 const speedValueEl = document.querySelector<HTMLSpanElement>('#speed-value')!
 const dampingValueEl = document.querySelector<HTMLSpanElement>('#damping-value')!
+const strengthValueEl = document.querySelector<HTMLSpanElement>('#strength-value')!
 const debugInput = document.querySelector<HTMLInputElement>('#debug-inspector')!
 const stressInput = document.querySelector<HTMLInputElement>('#stress-fractures')!
 const inspectorEl = document.querySelector<HTMLPreElement>('#inspector')!
@@ -128,7 +143,9 @@ const strength = new Uint16Array(MAX_PARTICLES + 1)
 const restTicks = new Uint16Array(MAX_PARTICLES + 1)
 const touched = new Uint32Array(MAX_PARTICLES + 1)
 const grounded = new Uint8Array(MAX_PARTICLES + 1)
+const verticalSupport = new Uint8Array(MAX_PARTICLES + 1)
 const supportDistance = new Uint16Array(MAX_PARTICLES + 1)
+const stressLineNext = new Int32Array(MAX_PARTICLES + 1)
 const carriedLoad = new Float32Array(MAX_PARTICLES + 1)
 const stress = new Float32Array(MAX_PARTICLES + 1)
 const activeIds: number[] = []
@@ -140,6 +157,7 @@ let selectedTool: Tool = 'loose'
 let brushRadius = Number(brushInput.value)
 let ticksPerSecond = Number(speedInput.value)
 let globalDamping = Number(dampingInput.value) / 100
+let packedStrength = Number(strengthInput.value)
 let isPainting = false
 let isPaused = false
 let isInspectorEnabled = false
@@ -191,11 +209,13 @@ function addParticle(col: number, row: number, particleKind: number) {
   vy[id] = 0
   mass[id] = particleKind === PACKED_DIRT ? 3 : 1
   stickiness[id] = particleKind === PACKED_DIRT ? 2 : 1
-  strength[id] = particleKind === PACKED_DIRT ? DEFAULT_PACKED_STRENGTH : 0
+  strength[id] = particleKind === PACKED_DIRT ? packedStrength : 0
   restTicks[id] = 0
   touched[id] = 0
   grounded[id] = 0
+  verticalSupport[id] = 0
   supportDistance[id] = UNSUPPORTED_DISTANCE
+  stressLineNext[id] = 0
   carriedLoad[id] = 0
   stress[id] = 0
   grid[indexAt(col, row)] = id
@@ -211,7 +231,9 @@ function removeParticle(id: number) {
   vy[id] = 0
   strength[id] = 0
   restTicks[id] = 0
+  verticalSupport[id] = 0
   supportDistance[id] = UNSUPPORTED_DISTANCE
+  stressLineNext[id] = 0
   carriedLoad[id] = 0
   stress[id] = 0
   freeIds.push(id)
@@ -232,7 +254,9 @@ function setLoose(id: number) {
   stickiness[id] = 1
   strength[id] = 0
   restTicks[id] = 0
+  verticalSupport[id] = 0
   supportDistance[id] = UNSUPPORTED_DISTANCE
+  stressLineNext[id] = 0
   carriedLoad[id] = 0
   stress[id] = 0
 }
@@ -241,10 +265,16 @@ function setPacked(id: number) {
   kind[id] = PACKED_DIRT
   mass[id] = 3
   stickiness[id] = 2
-  strength[id] = DEFAULT_PACKED_STRENGTH
+  strength[id] = packedStrength
   restTicks[id] = 0
   vx[id] = 0
   vy[id] = 0
+}
+
+function updatePackedStrengths() {
+  for (let id = 1; id < nextId; id += 1) {
+    if (kind[id] === PACKED_DIRT) strength[id] = packedStrength
+  }
 }
 
 function clampVelocity(value: number) {
@@ -483,24 +513,36 @@ function updatePackedSupport() {
   }
 }
 
-function updatePackedStress() {
+function resetPackedStressFields() {
+  verticalSupport.fill(0)
   supportDistance.fill(UNSUPPORTED_DISTANCE)
+  stressLineNext.fill(0)
   carriedLoad.fill(0)
   stress.fill(0)
+}
 
+function queueStressLineNeighbor(neighbor: number, nextIdTowardSupport: number, nextDistance: number, queue: number[]) {
+  if (neighbor <= 0 || kind[neighbor] !== PACKED_DIRT || nextDistance >= supportDistance[neighbor]) return
+  supportDistance[neighbor] = nextDistance
+  stressLineNext[neighbor] = nextIdTowardSupport
+  queue.push(neighbor)
+}
+
+function updateStressLinePaths() {
   const queue: number[] = []
 
-  for (let row = GRID_HEIGHT - 1; row >= 0; row -= 1) {
-    for (let col = 0; col < GRID_WIDTH; col += 1) {
+  for (let col = 0; col < GRID_WIDTH; col += 1) {
+    for (let row = GRID_HEIGHT - 1; row >= 0; row -= 1) {
       const id = cellId(col, row)
       if (id <= 0 || kind[id] !== PACKED_DIRT) continue
 
       const below = row === GRID_HEIGHT - 1 ? EMPTY : cellId(col, row + 1)
-      const hasTrueVerticalSupport =
+      const hasDirectVerticalSupport =
         row === GRID_HEIGHT - 1 ||
-        (below > 0 && kind[below] === PACKED_DIRT && supportDistance[below] === 0)
+        (below > 0 && kind[below] === PACKED_DIRT && verticalSupport[below] === 1)
 
-      if (hasTrueVerticalSupport) {
+      if (hasDirectVerticalSupport) {
+        verticalSupport[id] = 1
         supportDistance[id] = 0
         queue.push(id)
       }
@@ -510,22 +552,15 @@ function updatePackedStress() {
   for (let head = 0; head < queue.length; head += 1) {
     const id = queue[head]
     const nextDistance = supportDistance[id] + 1
-    const neighbors = [
-      [x[id] + 1, y[id]],
-      [x[id] - 1, y[id]],
-      [x[id], y[id] + 1],
-      [x[id], y[id] - 1],
-    ]
 
-    for (const [col, row] of neighbors) {
-      const neighbor = cellId(col, row)
-      if (neighbor > 0 && kind[neighbor] === PACKED_DIRT && nextDistance < supportDistance[neighbor]) {
-        supportDistance[neighbor] = nextDistance
-        queue.push(neighbor)
-      }
-    }
+    queueStressLineNeighbor(cellId(x[id] + 1, y[id]), id, nextDistance, queue)
+    queueStressLineNeighbor(cellId(x[id] - 1, y[id]), id, nextDistance, queue)
+    queueStressLineNeighbor(cellId(x[id], y[id] + 1), id, nextDistance, queue)
+    queueStressLineNeighbor(cellId(x[id], y[id] - 1), id, nextDistance, queue)
   }
+}
 
+function updateCarriedLoads() {
   for (let col = 0; col < GRID_WIDTH; col += 1) {
     let columnLoad = 0
     for (let row = 0; row < GRID_HEIGHT; row += 1) {
@@ -541,50 +576,76 @@ function updatePackedStress() {
       }
     }
   }
+}
 
+function stressLineEffectiveLoadFor(id: number) {
+  const carriedMass = Math.max(0, carriedLoad[id] - mass[id])
+  return mass[id] + carriedMass * STRESS_LINE_CARRIED_LOAD_FACTOR
+}
+
+function stressLineLoadFor(id: number) {
+  const distance = supportDistance[id]
+  const distanceScale = 1 + Math.pow(distance, STRESS_LINE_DISTANCE_EXPONENT) * STRESS_LINE_DISTANCE_MULTIPLIER
+  return stressLineEffectiveLoadFor(id) * STRESS_LINE_LOAD_MULTIPLIER * distanceScale
+}
+
+function depositStressLineLoad(source: number, lineLoad: number) {
+  const distance = supportDistance[source]
+  let current = source
+  let pathStep = 0
+  const maxSteps = Math.min(distance + 1, STRESS_LINE_MAX_PATH_STEPS)
+
+  while (current > 0 && pathStep < maxSteps) {
+    if (kind[current] !== PACKED_DIRT) break
+
+    const supportProgress = distance > 0 ? pathStep / distance : 1
+    stress[current] += lineLoad * (1 + supportProgress * STRESS_LINE_SUPPORT_BIAS)
+
+    if (verticalSupport[current] === 1) break
+    current = stressLineNext[current]
+    pathStep += 1
+  }
+}
+
+function accumulateStressLines() {
   for (let id = 1; id < nextId; id += 1) {
     if (kind[id] !== PACKED_DIRT) continue
-    if (!hasEmptyBelow(id)) continue
+    if (verticalSupport[id] === 1 || supportDistance[id] === UNSUPPORTED_DISTANCE) continue
+    depositStressLineLoad(id, stressLineLoadFor(id))
+  }
+}
 
-    const neighbors = [cellId(x[id] - 1, y[id]), cellId(x[id] + 1, y[id])].filter(
-      (neighbor) => neighbor > 0 && kind[neighbor] === PACKED_DIRT,
-    )
-    const load = Math.max(mass[id], carriedLoad[id]) * LOCAL_OVERHANG_STRESS_MULTIPLIER
+function recalculatePackedStress() {
+  resetPackedStressFields()
+  updateStressLinePaths()
+  updateCarriedLoads()
+  accumulateStressLines()
+}
 
-    if (neighbors.length === 0) {
-      stress[id] += load
-      continue
+function updatePackedStress() {
+  for (let pass = 0; pass <= MAX_STRESS_FRACTURE_REPASSES; pass += 1) {
+    recalculatePackedStress()
+
+    const breaks: number[] = []
+
+    for (let id = 1; id < nextId; id += 1) {
+      if (kind[id] === PACKED_DIRT && stress[id] > strength[id]) {
+        breaks.push(id)
+      }
     }
 
-    const sharedLoad = load / neighbors.length
-    for (const neighbor of neighbors) {
-      stress[neighbor] += sharedLoad
+    if (breaks.length === 0) return
+
+    for (const id of breaks) {
+      if (kind[id] !== PACKED_DIRT) continue
+      setLoose(id)
+      vy[id] = Math.max(vy[id], 1)
     }
+
+    updatePackedSupport()
   }
 
-  for (let id = 1; id < nextId; id += 1) {
-    if (kind[id] !== PACKED_DIRT) continue
-    if (supportDistance[id] === 0 || supportDistance[id] === UNSUPPORTED_DISTANCE) continue
-
-    const load = Math.max(mass[id], carriedLoad[id])
-    stress[id] += load * supportDistance[id] * SUPPORT_DISTANCE_STRESS_MULTIPLIER
-  }
-
-  const breaks: number[] = []
-
-  for (let id = 1; id < nextId; id += 1) {
-    if (kind[id] === PACKED_DIRT && stress[id] > strength[id]) {
-      breaks.push(id)
-    }
-  }
-
-  for (const id of breaks) {
-    if (kind[id] !== PACKED_DIRT) continue
-    setLoose(id)
-    vy[id] = Math.max(vy[id], 1)
-  }
-
-  if (breaks.length > 0) updatePackedSupport()
+  recalculatePackedStress()
 }
 
 function compactActiveList() {
@@ -626,6 +687,8 @@ function drawGrid() {
           ctx.fillStyle = '#9f5f3f'
         } else if (isStressEnabled && stressRatio > 0.55) {
           ctx.fillStyle = '#72503b'
+        } else if (isStressEnabled && verticalSupport[id] === 1) {
+          ctx.fillStyle = '#4f392d'
         } else {
           ctx.fillStyle = grounded[id] ? '#5a4031' : '#80614d'
         }
@@ -686,9 +749,12 @@ function updateInspector() {
     `mass: ${mass[id]}`,
     `stickiness: ${stickiness[id]}`,
     `strength: ${strength[id]}`,
-    `load: ${carriedLoad[id].toFixed(1)}`,
+    `carried load: ${carriedLoad[id].toFixed(1)}`,
+    `stress load: ${stressLineEffectiveLoadFor(id).toFixed(1)}`,
     `stress: ${stress[id].toFixed(1)}`,
-    `support dist: ${supportDistance[id] === UNSUPPORTED_DISTANCE ? 'none' : supportDistance[id]}`,
+    `stress line: ${supportDistance[id] === UNSUPPORTED_DISTANCE ? 'none' : `${supportDistance[id]} steps`}`,
+    `next support step: ${stressLineNext[id] || 'none'}`,
+    `vertical support: ${verticalSupport[id] === 1 ? 'yes' : 'no'}`,
     `empty below: ${hasEmptyBelow(id) ? 'yes' : 'no'}`,
     `rest ticks: ${restTicks[id]}`,
     `grounded: ${grounded[id] === 1 ? 'yes' : 'no'}`,
@@ -795,6 +861,12 @@ dampingInput.addEventListener('input', () => {
   dampingValueEl.textContent = `${dampingInput.value}%`
 })
 
+strengthInput.addEventListener('input', () => {
+  packedStrength = Number(strengthInput.value)
+  strengthValueEl.textContent = `${packedStrength}`
+  updatePackedStrengths()
+})
+
 debugInput.addEventListener('change', () => {
   isInspectorEnabled = debugInput.checked
   updateInspector()
@@ -805,7 +877,9 @@ stressInput.addEventListener('change', () => {
   if (!isStressEnabled) {
     stress.fill(0)
     carriedLoad.fill(0)
+    verticalSupport.fill(0)
     supportDistance.fill(UNSUPPORTED_DISTANCE)
+    stressLineNext.fill(0)
   }
 })
 
@@ -830,7 +904,9 @@ clearButton.addEventListener('click', () => {
   strength.fill(0)
   stress.fill(0)
   carriedLoad.fill(0)
+  verticalSupport.fill(0)
   supportDistance.fill(UNSUPPORTED_DISTANCE)
+  stressLineNext.fill(0)
   activeIds.length = 0
   freeIds.length = 0
   nextId = 1

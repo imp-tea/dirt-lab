@@ -83,6 +83,8 @@ input:focus-visible {
   display: flex;
   flex-direction: column;
   gap: 24px;
+  height: 100vh;
+  overflow: auto;
   border-left: 1px solid #303332;
   padding: 24px;
   background: #1e2021;
@@ -197,7 +199,8 @@ input[type="range"] {
 }
 
 .inspector {
-  min-height: 148px;
+  height: 236px;
+  min-height: 236px;
   margin: -12px 0 0;
   overflow: auto;
   border: 1px solid #343736;
