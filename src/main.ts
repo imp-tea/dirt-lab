@@ -12,6 +12,11 @@ const GRAVITY = 1
 const DEFAULT_TICKS_PER_SECOND = 28
 const DEFAULT_DAMPING = 0
 const PACK_AFTER_REST_TICKS = 5
+const DEFAULT_PACKED_STRENGTH = 200
+const LOCAL_OVERHANG_STRESS_MULTIPLIER = 5.0
+const SUPPORT_DISTANCE_STRESS_MULTIPLIER = 0.18
+const UNSUPPORTED_DISTANCE = 65535
+const STRESS_INTERVAL_TICKS = 4
 
 type Tool = 'loose' | 'packed' | 'erase'
 
@@ -77,6 +82,11 @@ app.innerHTML = `
         <input id="debug-inspector" type="checkbox" />
       </label>
 
+      <label class="toggle-row" for="stress-fractures">
+        <span>Stress fractures</span>
+        <input id="stress-fractures" type="checkbox" checked />
+      </label>
+
       <pre id="inspector" class="inspector" aria-live="polite">Inspector off</pre>
 
       <div class="legend" aria-label="Materials">
@@ -97,6 +107,7 @@ const dampingInput = document.querySelector<HTMLInputElement>('#damping')!
 const speedValueEl = document.querySelector<HTMLSpanElement>('#speed-value')!
 const dampingValueEl = document.querySelector<HTMLSpanElement>('#damping-value')!
 const debugInput = document.querySelector<HTMLInputElement>('#debug-inspector')!
+const stressInput = document.querySelector<HTMLInputElement>('#stress-fractures')!
 const inspectorEl = document.querySelector<HTMLPreElement>('#inspector')!
 const pauseButton = document.querySelector<HTMLButtonElement>('#pause')!
 const stepButton = document.querySelector<HTMLButtonElement>('#step')!
@@ -113,9 +124,13 @@ const vx = new Int16Array(MAX_PARTICLES + 1)
 const vy = new Int16Array(MAX_PARTICLES + 1)
 const mass = new Uint8Array(MAX_PARTICLES + 1)
 const stickiness = new Uint8Array(MAX_PARTICLES + 1)
+const strength = new Uint16Array(MAX_PARTICLES + 1)
 const restTicks = new Uint16Array(MAX_PARTICLES + 1)
 const touched = new Uint32Array(MAX_PARTICLES + 1)
 const grounded = new Uint8Array(MAX_PARTICLES + 1)
+const supportDistance = new Uint16Array(MAX_PARTICLES + 1)
+const carriedLoad = new Float32Array(MAX_PARTICLES + 1)
+const stress = new Float32Array(MAX_PARTICLES + 1)
 const activeIds: number[] = []
 const freeIds: number[] = []
 
@@ -128,11 +143,14 @@ let globalDamping = Number(dampingInput.value) / 100
 let isPainting = false
 let isPaused = false
 let isInspectorEnabled = false
+let isStressEnabled = true
 let hoverCol = -1
 let hoverRow = -1
 let lastFrame = performance.now()
 let fps = 0
 let simAccumulator = 0
+
+supportDistance.fill(UNSUPPORTED_DISTANCE)
 
 for (let row = GRID_HEIGHT - 10; row < GRID_HEIGHT; row += 1) {
   for (let col = 0; col < GRID_WIDTH; col += 1) {
@@ -173,9 +191,13 @@ function addParticle(col: number, row: number, particleKind: number) {
   vy[id] = 0
   mass[id] = particleKind === PACKED_DIRT ? 3 : 1
   stickiness[id] = particleKind === PACKED_DIRT ? 2 : 1
+  strength[id] = particleKind === PACKED_DIRT ? DEFAULT_PACKED_STRENGTH : 0
   restTicks[id] = 0
   touched[id] = 0
   grounded[id] = 0
+  supportDistance[id] = UNSUPPORTED_DISTANCE
+  carriedLoad[id] = 0
+  stress[id] = 0
   grid[indexAt(col, row)] = id
   activeIds.push(id)
   return id
@@ -187,7 +209,11 @@ function removeParticle(id: number) {
   kind[id] = EMPTY
   vx[id] = 0
   vy[id] = 0
+  strength[id] = 0
   restTicks[id] = 0
+  supportDistance[id] = UNSUPPORTED_DISTANCE
+  carriedLoad[id] = 0
+  stress[id] = 0
   freeIds.push(id)
 }
 
@@ -204,13 +230,18 @@ function setLoose(id: number) {
   kind[id] = LOOSE_DIRT
   mass[id] = 1
   stickiness[id] = 1
+  strength[id] = 0
   restTicks[id] = 0
+  supportDistance[id] = UNSUPPORTED_DISTANCE
+  carriedLoad[id] = 0
+  stress[id] = 0
 }
 
 function setPacked(id: number) {
   kind[id] = PACKED_DIRT
   mass[id] = 3
   stickiness[id] = 2
+  strength[id] = DEFAULT_PACKED_STRENGTH
   restTicks[id] = 0
   vx[id] = 0
   vy[id] = 0
@@ -254,7 +285,7 @@ function exchangeMomentum(a: number, b: number, axis: 'x' | 'y') {
     vy[b] = quantizeVelocity(nextB)
   }
 
-  if (kind[b] === PACKED_DIRT && Math.abs(av) + Math.abs(bv) > 3) {
+  if (kind[b] === PACKED_DIRT && Math.abs(av) + Math.abs(bv) > 3 && !hasDirectPackedColumnToGround(b)) {
     setLoose(b)
   }
 }
@@ -286,14 +317,18 @@ function attemptAxisMove(id: number, axis: 'x' | 'y', allowCollisionSideStep = t
 
       if (axis === 'y' && direction > 0 && steps <= 1) {
         vy[id] = 0
-        return (allowCollisionSideStep && tryDiagonalFall(id)) || movedToNearestOpen
+        const fellDiagonally = allowCollisionSideStep && tryDiagonalFall(id)
+        if (!fellDiagonally && shouldPackAgainstStableColumn(id)) setPacked(id)
+        return fellDiagonally || movedToNearestOpen
       }
 
       exchangeMomentum(id, occupant, axis)
 
       if (axis === 'y' && direction > 0 && allowCollisionSideStep) {
         vy[id] = 0
-        return tryDiagonalFall(id) || movedToNearestOpen
+        const fellDiagonally = tryDiagonalFall(id)
+        if (!fellDiagonally && shouldPackAgainstStableColumn(id)) setPacked(id)
+        return fellDiagonally || movedToNearestOpen
       }
 
       if (axis === 'x') {
@@ -316,6 +351,27 @@ function attemptAxisMove(id: number, axis: 'x' | 'y', allowCollisionSideStep = t
 
 function hasSupport(id: number) {
   return y[id] === GRID_HEIGHT - 1 || cellId(x[id], y[id] + 1) > 0
+}
+
+function hasEmptyBelow(id: number) {
+  return y[id] < GRID_HEIGHT - 1 && cellId(x[id], y[id] + 1) === EMPTY
+}
+
+function hasDirectPackedColumnToGround(id: number) {
+  if (id <= 0 || kind[id] !== PACKED_DIRT) return false
+
+  for (let row = y[id]; row < GRID_HEIGHT; row += 1) {
+    const columnId = cellId(x[id], row)
+    if (columnId <= 0 || kind[columnId] !== PACKED_DIRT) return false
+  }
+
+  return true
+}
+
+function shouldPackAgainstStableColumn(id: number) {
+  if (y[id] >= GRID_HEIGHT - 1) return false
+  const below = cellId(x[id], y[id] + 1)
+  return hasDirectPackedColumnToGround(below)
 }
 
 function tryDiagonalFall(id: number) {
@@ -364,9 +420,14 @@ function updateLooseParticle(id: number) {
   }
 
   const movedVertical = attemptAxisMove(id, 'y', hadVerticalVelocityBeforeGravity)
+  if (kind[id] !== LOOSE_DIRT) return
 
   if (!movedVertical && vy[id] === 0) {
-    tryRestingSlide(id)
+    const fellDiagonally = tryRestingSlide(id)
+    if (!fellDiagonally && shouldPackAgainstStableColumn(id)) {
+      setPacked(id)
+      return
+    }
   }
 
   if (vx[id] !== 0) {
@@ -422,6 +483,110 @@ function updatePackedSupport() {
   }
 }
 
+function updatePackedStress() {
+  supportDistance.fill(UNSUPPORTED_DISTANCE)
+  carriedLoad.fill(0)
+  stress.fill(0)
+
+  const queue: number[] = []
+
+  for (let row = GRID_HEIGHT - 1; row >= 0; row -= 1) {
+    for (let col = 0; col < GRID_WIDTH; col += 1) {
+      const id = cellId(col, row)
+      if (id <= 0 || kind[id] !== PACKED_DIRT) continue
+
+      const below = row === GRID_HEIGHT - 1 ? EMPTY : cellId(col, row + 1)
+      const hasTrueVerticalSupport =
+        row === GRID_HEIGHT - 1 ||
+        (below > 0 && kind[below] === PACKED_DIRT && supportDistance[below] === 0)
+
+      if (hasTrueVerticalSupport) {
+        supportDistance[id] = 0
+        queue.push(id)
+      }
+    }
+  }
+
+  for (let head = 0; head < queue.length; head += 1) {
+    const id = queue[head]
+    const nextDistance = supportDistance[id] + 1
+    const neighbors = [
+      [x[id] + 1, y[id]],
+      [x[id] - 1, y[id]],
+      [x[id], y[id] + 1],
+      [x[id], y[id] - 1],
+    ]
+
+    for (const [col, row] of neighbors) {
+      const neighbor = cellId(col, row)
+      if (neighbor > 0 && kind[neighbor] === PACKED_DIRT && nextDistance < supportDistance[neighbor]) {
+        supportDistance[neighbor] = nextDistance
+        queue.push(neighbor)
+      }
+    }
+  }
+
+  for (let col = 0; col < GRID_WIDTH; col += 1) {
+    let columnLoad = 0
+    for (let row = 0; row < GRID_HEIGHT; row += 1) {
+      const id = cellId(col, row)
+      if (id <= 0) {
+        columnLoad = 0
+        continue
+      }
+
+      columnLoad += mass[id]
+      if (kind[id] === PACKED_DIRT) {
+        carriedLoad[id] += columnLoad
+      }
+    }
+  }
+
+  for (let id = 1; id < nextId; id += 1) {
+    if (kind[id] !== PACKED_DIRT) continue
+    if (!hasEmptyBelow(id)) continue
+
+    const neighbors = [cellId(x[id] - 1, y[id]), cellId(x[id] + 1, y[id])].filter(
+      (neighbor) => neighbor > 0 && kind[neighbor] === PACKED_DIRT,
+    )
+    const load = Math.max(mass[id], carriedLoad[id]) * LOCAL_OVERHANG_STRESS_MULTIPLIER
+
+    if (neighbors.length === 0) {
+      stress[id] += load
+      continue
+    }
+
+    const sharedLoad = load / neighbors.length
+    for (const neighbor of neighbors) {
+      stress[neighbor] += sharedLoad
+    }
+  }
+
+  for (let id = 1; id < nextId; id += 1) {
+    if (kind[id] !== PACKED_DIRT) continue
+    if (supportDistance[id] === 0 || supportDistance[id] === UNSUPPORTED_DISTANCE) continue
+
+    const load = Math.max(mass[id], carriedLoad[id])
+    stress[id] += load * supportDistance[id] * SUPPORT_DISTANCE_STRESS_MULTIPLIER
+  }
+
+  const breaks: number[] = []
+
+  for (let id = 1; id < nextId; id += 1) {
+    if (kind[id] === PACKED_DIRT && stress[id] > strength[id]) {
+      breaks.push(id)
+    }
+  }
+
+  for (const id of breaks) {
+    if (kind[id] !== PACKED_DIRT) continue
+    setLoose(id)
+    vy[id] = Math.max(vy[id], 1)
+  }
+
+  if (breaks.length > 0) updatePackedSupport()
+}
+
 function compactActiveList() {
   let write = 0
   for (let read = 0; read < activeIds.length; read += 1) {
@@ -441,6 +606,7 @@ function simulate() {
     for (let i = 0; i < activeIds.length; i += 1) updateLooseParticle(activeIds[i])
   }
 
+  if (isStressEnabled && tick % STRESS_INTERVAL_TICKS === 0) updatePackedStress()
   if (tick % 12 === 0) updatePackedSupport()
   if (tick % 60 === 0) compactActiveList()
 }
@@ -455,7 +621,14 @@ function drawGrid() {
       if (id <= 0) continue
 
       if (kind[id] === PACKED_DIRT) {
-        ctx.fillStyle = grounded[id] ? '#5a4031' : '#80614d'
+        const stressRatio = strength[id] > 0 ? stress[id] / strength[id] : 0
+        if (isStressEnabled && stressRatio > 0.8) {
+          ctx.fillStyle = '#9f5f3f'
+        } else if (isStressEnabled && stressRatio > 0.55) {
+          ctx.fillStyle = '#72503b'
+        } else {
+          ctx.fillStyle = grounded[id] ? '#5a4031' : '#80614d'
+        }
       } else {
         const speed = Math.min(5, Math.abs(vx[id]) + Math.abs(vy[id]))
         ctx.fillStyle = ['#b4804e', '#c28c55', '#d09a5c', '#dda662', '#e7b16a', '#f0bf79'][speed]
@@ -512,6 +685,11 @@ function updateInspector() {
     `velocity: ${vx[id]}, ${vy[id]}`,
     `mass: ${mass[id]}`,
     `stickiness: ${stickiness[id]}`,
+    `strength: ${strength[id]}`,
+    `load: ${carriedLoad[id].toFixed(1)}`,
+    `stress: ${stress[id].toFixed(1)}`,
+    `support dist: ${supportDistance[id] === UNSUPPORTED_DISTANCE ? 'none' : supportDistance[id]}`,
+    `empty below: ${hasEmptyBelow(id) ? 'yes' : 'no'}`,
     `rest ticks: ${restTicks[id]}`,
     `grounded: ${grounded[id] === 1 ? 'yes' : 'no'}`,
   ].join('\n')
@@ -622,6 +800,15 @@ debugInput.addEventListener('change', () => {
   updateInspector()
 })
 
+stressInput.addEventListener('change', () => {
+  isStressEnabled = stressInput.checked
+  if (!isStressEnabled) {
+    stress.fill(0)
+    carriedLoad.fill(0)
+    supportDistance.fill(UNSUPPORTED_DISTANCE)
+  }
+})
+
 pauseButton.addEventListener('click', () => {
   isPaused = !isPaused
   pauseButton.textContent = isPaused ? 'Run' : 'Pause'
@@ -640,6 +827,10 @@ stepButton.addEventListener('click', () => {
 clearButton.addEventListener('click', () => {
   grid.fill(EMPTY)
   kind.fill(EMPTY)
+  strength.fill(0)
+  stress.fill(0)
+  carriedLoad.fill(0)
+  supportDistance.fill(UNSUPPORTED_DISTANCE)
   activeIds.length = 0
   freeIds.length = 0
   nextId = 1
