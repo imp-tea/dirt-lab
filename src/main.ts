@@ -11,18 +11,26 @@ const PACKED_DIRT = 2
 const MAX_SPEED = 8
 const GRAVITY = 1
 const DEFAULT_TICKS_PER_SECOND = 28
-const DEFAULT_DAMPING = 0
 const PACK_AFTER_REST_TICKS = 5
-const DEFAULT_PACKED_STRENGTH = 400
+const DEFAULT_PACKED_STRENGTH = 4000
 const STRESS_LINE_LOAD_MULTIPLIER = 0.8
 const STRESS_LINE_CARRIED_LOAD_FACTOR = 0.08
 const STRESS_LINE_DISTANCE_MULTIPLIER = 0.28
 const STRESS_LINE_DISTANCE_EXPONENT = 1.2
 const STRESS_LINE_SUPPORT_BIAS = 0.65
 const STRESS_LINE_MAX_PATH_STEPS = GRID_WIDTH + GRID_HEIGHT
-const MAX_STRESS_FRACTURE_REPASSES = 3
 const UNSUPPORTED_DISTANCE = 65535
-const STRESS_INTERVAL_TICKS = 4
+let maxStressFractureRepasses = 5
+let stressIntervalTicks = 1
+let verticalSupportPackedBelow = 0
+let contactSolverIterations = 18
+let contactForceEpsilon = 2.95
+const CONTACT_GRAVITY_FORCE = 4
+const CONTACT_GLUE_STRENGTH_SCALE = 1
+const CONTACT_RESIDUAL_STRENGTH_SCALE = 0.02
+const CONTACT_BREAK_VELOCITY_SCALE = 0.22
+const CONTACT_MAX_BREAK_SPEED = 5
+const USE_CONTACT_FORCE_STRESS_MODEL = true
 const POLYGON_REBUILD_INTERVAL_TICKS = 6
 const CONTOUR_REBUILD_INTERVAL_TICKS = 6
 const CONTOUR_SIMPLIFY_EPSILON = 0.65
@@ -32,7 +40,13 @@ const PHYSICS_STEP_SECONDS = 1 / 60
 const VEHICLE_START_COL = 64
 const VEHICLE_START_ROW = 70
 const VEHICLE_MOTOR_SPEED = 18
-const VEHICLE_MOTOR_TORQUE = 850
+const VEHICLE_MOTOR_TORQUE = 2400
+const VEHICLE_WHEEL_RADIUS = 2.4
+const VEHICLE_WHEEL_Y_OFFSET = 2.9
+const VEHICLE_TIRE_FRICTION = 6
+const VEHICLE_FLIP_UPWARD_IMPULSE = 430
+const VEHICLE_FLIP_SIDE_IMPULSE = 90
+const VEHICLE_FLIP_ANGULAR_IMPULSE = 520
 
 type Tool = 'loose' | 'packed' | 'erase'
 type Point = { x: number; y: number }
@@ -85,18 +99,53 @@ app.innerHTML = `
 
       <div class="control-group">
         <div class="label-row">
-          <label for="damping">Damping</label>
-          <span id="damping-value">0%</span>
+          <label for="strength">Strength</label>
+          <span id="strength-value">${DEFAULT_PACKED_STRENGTH}</span>
         </div>
-        <input id="damping" type="range" min="0" max="60" value="${DEFAULT_DAMPING}" />
+        <div class="input-action-row">
+          <input id="strength" type="number" min="0" step="1" value="${DEFAULT_PACKED_STRENGTH}" />
+          <button id="apply-strength" type="button" title="Apply strength to packed dirt">Apply</button>
+        </div>
       </div>
 
       <div class="control-group">
         <div class="label-row">
-          <label for="strength">Strength</label>
-          <span id="strength-value">${DEFAULT_PACKED_STRENGTH}</span>
+          <label for="max-stress-repasses">Fracture repasses</label>
+          <span id="max-stress-repasses-value">${maxStressFractureRepasses}</span>
         </div>
-        <input id="strength" type="range" min="20" max="500" step="10" value="${DEFAULT_PACKED_STRENGTH}" />
+        <input id="max-stress-repasses" type="range" min="0" max="10" step="1" value="${maxStressFractureRepasses}" />
+      </div>
+
+      <div class="control-group">
+        <div class="label-row">
+          <label for="stress-interval">Stress interval</label>
+          <span id="stress-interval-value">${stressIntervalTicks}</span>
+        </div>
+        <input id="stress-interval" type="range" min="1" max="60" step="1" value="${stressIntervalTicks}" />
+      </div>
+
+      <div class="control-group">
+        <div class="label-row">
+          <label for="vertical-support-packed-below">Packed below</label>
+          <span id="vertical-support-packed-below-value">${verticalSupportPackedBelow}</span>
+        </div>
+        <input id="vertical-support-packed-below" type="range" min="0" max="50" step="1" value="${verticalSupportPackedBelow}" />
+      </div>
+
+      <div class="control-group">
+        <div class="label-row">
+          <label for="contact-solver-iterations">Solver iterations</label>
+          <span id="contact-solver-iterations-value">${contactSolverIterations}</span>
+        </div>
+        <input id="contact-solver-iterations" type="range" min="1" max="80" step="1" value="${contactSolverIterations}" />
+      </div>
+
+      <div class="control-group">
+        <div class="label-row">
+          <label for="contact-force-epsilon">Force epsilon</label>
+          <span id="contact-force-epsilon-value">${contactForceEpsilon}</span>
+        </div>
+        <input id="contact-force-epsilon" type="range" min="0" max="5" step="0.05" value="${contactForceEpsilon}" />
       </div>
 
       <div class="button-row">
@@ -113,11 +162,6 @@ app.innerHTML = `
       <label class="toggle-row" for="stress-fractures">
         <span>Stress fractures</span>
         <input id="stress-fractures" type="checkbox" checked />
-      </label>
-
-      <label class="toggle-row" for="packed-polygons">
-        <span>Packed polygons</span>
-        <input id="packed-polygons" type="checkbox" />
       </label>
 
       <label class="toggle-row" for="packed-contours">
@@ -141,14 +185,22 @@ const fpsEl = document.querySelector<HTMLSpanElement>('#fps')!
 const countEl = document.querySelector<HTMLSpanElement>('#count')!
 const brushInput = document.querySelector<HTMLInputElement>('#brush')!
 const speedInput = document.querySelector<HTMLInputElement>('#speed')!
-const dampingInput = document.querySelector<HTMLInputElement>('#damping')!
 const strengthInput = document.querySelector<HTMLInputElement>('#strength')!
+const applyStrengthButton = document.querySelector<HTMLButtonElement>('#apply-strength')!
+const maxStressRepassesInput = document.querySelector<HTMLInputElement>('#max-stress-repasses')!
+const stressIntervalInput = document.querySelector<HTMLInputElement>('#stress-interval')!
+const verticalSupportPackedBelowInput = document.querySelector<HTMLInputElement>('#vertical-support-packed-below')!
+const contactSolverIterationsInput = document.querySelector<HTMLInputElement>('#contact-solver-iterations')!
+const contactForceEpsilonInput = document.querySelector<HTMLInputElement>('#contact-force-epsilon')!
 const speedValueEl = document.querySelector<HTMLSpanElement>('#speed-value')!
-const dampingValueEl = document.querySelector<HTMLSpanElement>('#damping-value')!
 const strengthValueEl = document.querySelector<HTMLSpanElement>('#strength-value')!
+const maxStressRepassesValueEl = document.querySelector<HTMLSpanElement>('#max-stress-repasses-value')!
+const stressIntervalValueEl = document.querySelector<HTMLSpanElement>('#stress-interval-value')!
+const verticalSupportPackedBelowValueEl = document.querySelector<HTMLSpanElement>('#vertical-support-packed-below-value')!
+const contactSolverIterationsValueEl = document.querySelector<HTMLSpanElement>('#contact-solver-iterations-value')!
+const contactForceEpsilonValueEl = document.querySelector<HTMLSpanElement>('#contact-force-epsilon-value')!
 const debugInput = document.querySelector<HTMLInputElement>('#debug-inspector')!
 const stressInput = document.querySelector<HTMLInputElement>('#stress-fractures')!
-const polygonInput = document.querySelector<HTMLInputElement>('#packed-polygons')!
 const contourInput = document.querySelector<HTMLInputElement>('#packed-contours')!
 const inspectorEl = document.querySelector<HTMLPreElement>('#inspector')!
 const pauseButton = document.querySelector<HTMLButtonElement>('#pause')!
@@ -166,7 +218,7 @@ const vx = new Int16Array(MAX_PARTICLES + 1)
 const vy = new Int16Array(MAX_PARTICLES + 1)
 const mass = new Uint8Array(MAX_PARTICLES + 1)
 const stickiness = new Uint8Array(MAX_PARTICLES + 1)
-const strength = new Uint16Array(MAX_PARTICLES + 1)
+const strength = new Float32Array(MAX_PARTICLES + 1)
 const restTicks = new Uint16Array(MAX_PARTICLES + 1)
 const touched = new Uint32Array(MAX_PARTICLES + 1)
 const grounded = new Uint8Array(MAX_PARTICLES + 1)
@@ -175,6 +227,10 @@ const supportDistance = new Uint16Array(MAX_PARTICLES + 1)
 const stressLineNext = new Int32Array(MAX_PARTICLES + 1)
 const carriedLoad = new Float32Array(MAX_PARTICLES + 1)
 const stress = new Float32Array(MAX_PARTICLES + 1)
+const residualForceX = new Float32Array(MAX_PARTICLES + 1)
+const residualForceY = new Float32Array(MAX_PARTICLES + 1)
+const glueLoad = new Float32Array(MAX_PARTICLES + 1)
+const normalLoad = new Float32Array(MAX_PARTICLES + 1)
 const polygonVisited = new Uint8Array(MAX_PARTICLES)
 const activeIds: number[] = []
 const freeIds: number[] = []
@@ -184,7 +240,7 @@ let tick = 1
 let selectedTool: Tool = 'loose'
 let brushRadius = Number(brushInput.value)
 let ticksPerSecond = Number(speedInput.value)
-let globalDamping = Number(dampingInput.value) / 100
+let globalDamping = 0
 let packedStrength = Number(strengthInput.value)
 let isPainting = false
 let isPaused = false
@@ -219,16 +275,9 @@ const physicsWorld = new World({
 
 supportDistance.fill(UNSUPPORTED_DISTANCE)
 
-for (let row = GRID_HEIGHT - 10; row < GRID_HEIGHT; row += 1) {
+for (let row = Math.floor((GRID_HEIGHT * 2) / 3); row < GRID_HEIGHT; row += 1) {
   for (let col = 0; col < GRID_WIDTH; col += 1) {
-    if (Math.random() > 0.04) addParticle(col, row, PACKED_DIRT)
-  }
-}
-
-for (let row = GRID_HEIGHT - 18; row < GRID_HEIGHT - 10; row += 1) {
-  const edge = Math.abs(row - (GRID_HEIGHT - 14))
-  for (let col = 35 + edge * 3; col < 92 - edge * 2; col += 1) {
-    if (Math.random() > 0.15) addParticle(col, row, PACKED_DIRT)
+    addParticle(col, row, PACKED_DIRT)
   }
 }
 
@@ -267,6 +316,10 @@ function addParticle(col: number, row: number, particleKind: number) {
   stressLineNext[id] = 0
   carriedLoad[id] = 0
   stress[id] = 0
+  residualForceX[id] = 0
+  residualForceY[id] = 0
+  glueLoad[id] = 0
+  normalLoad[id] = 0
   grid[indexAt(col, row)] = id
   activeIds.push(id)
   if (particleKind === PACKED_DIRT) {
@@ -289,6 +342,10 @@ function removeParticle(id: number) {
   stressLineNext[id] = 0
   carriedLoad[id] = 0
   stress[id] = 0
+  residualForceX[id] = 0
+  residualForceY[id] = 0
+  glueLoad[id] = 0
+  normalLoad[id] = 0
   isPackedPolygonCacheDirty = true
   isPackedContourCacheDirty = true
   freeIds.push(id)
@@ -315,6 +372,10 @@ function setLoose(id: number) {
   stressLineNext[id] = 0
   carriedLoad[id] = 0
   stress[id] = 0
+  residualForceX[id] = 0
+  residualForceY[id] = 0
+  glueLoad[id] = 0
+  normalLoad[id] = 0
   if (wasPacked) {
     isPackedPolygonCacheDirty = true
     isPackedContourCacheDirty = true
@@ -330,6 +391,10 @@ function setPacked(id: number) {
   restTicks[id] = 0
   vx[id] = 0
   vy[id] = 0
+  residualForceX[id] = 0
+  residualForceY[id] = 0
+  glueLoad[id] = 0
+  normalLoad[id] = 0
   if (!wasPacked) {
     isPackedPolygonCacheDirty = true
     isPackedContourCacheDirty = true
@@ -546,11 +611,7 @@ function updatePackedSupport() {
   const queue: number[] = []
 
   for (let col = 0; col < GRID_WIDTH; col += 1) {
-    const id = cellId(col, GRID_HEIGHT - 1)
-    if (id > 0 && kind[id] === PACKED_DIRT) {
-      grounded[id] = 1
-      queue.push(id)
-    }
+    queueGroundedPackedCell(col, GRID_HEIGHT - 1, queue)
   }
 
   for (let head = 0; head < queue.length; head += 1) {
@@ -584,6 +645,10 @@ function resetPackedStressFields() {
   stressLineNext.fill(0)
   carriedLoad.fill(0)
   stress.fill(0)
+  residualForceX.fill(0)
+  residualForceY.fill(0)
+  glueLoad.fill(0)
+  normalLoad.fill(0)
 }
 
 function queueStressLineNeighbor(neighbor: number, nextIdTowardSupport: number, nextDistance: number, queue: number[]) {
@@ -591,6 +656,17 @@ function queueStressLineNeighbor(neighbor: number, nextIdTowardSupport: number, 
   supportDistance[neighbor] = nextDistance
   stressLineNext[neighbor] = nextIdTowardSupport
   queue.push(neighbor)
+}
+
+function hasPackedColumnBelow(col: number, row: number, packedCount: number) {
+  const cellsToBottom = GRID_HEIGHT - 1 - row
+  const requiredPackedBelow = Math.min(packedCount, cellsToBottom)
+
+  for (let offset = 1; offset <= requiredPackedBelow; offset += 1) {
+    const below = cellId(col, row + offset)
+    if (below <= 0 || kind[below] !== PACKED_DIRT) return false
+  }
+  return true
 }
 
 function updateStressLinePaths() {
@@ -601,12 +677,7 @@ function updateStressLinePaths() {
       const id = cellId(col, row)
       if (id <= 0 || kind[id] !== PACKED_DIRT) continue
 
-      const below = row === GRID_HEIGHT - 1 ? EMPTY : cellId(col, row + 1)
-      const hasDirectVerticalSupport =
-        row === GRID_HEIGHT - 1 ||
-        (below > 0 && kind[below] === PACKED_DIRT && verticalSupport[below] === 1)
-
-      if (hasDirectVerticalSupport) {
+      if (hasPackedColumnBelow(col, row, verticalSupportPackedBelow)) {
         verticalSupport[id] = 1
         supportDistance[id] = 0
         queue.push(id)
@@ -687,14 +758,199 @@ function recalculatePackedStress() {
   accumulateStressLines()
 }
 
+function contactGlueLimitFor(id: number) {
+  return strength[id] * CONTACT_GLUE_STRENGTH_SCALE
+}
+
+function applyContactForce(id: number, neighbor: number, fxOnId: number, fyOnId: number) {
+  residualForceX[id] += fxOnId
+  residualForceY[id] += fyOnId
+
+  if (neighbor > 0 && kind[neighbor] === PACKED_DIRT) {
+    residualForceX[neighbor] -= fxOnId
+    residualForceY[neighbor] -= fyOnId
+  }
+}
+
+function queueGroundedPackedCell(col: number, row: number, queue: number[]) {
+  const id = cellId(col, row)
+  if (id > 0 && kind[id] === PACKED_DIRT && grounded[id] === 0) {
+    grounded[id] = 1
+    queue.push(id)
+  }
+}
+
+function relaxNormalForces(id: number) {
+  const downwardForce = residualForceY[id]
+  if (downwardForce > contactForceEpsilon) {
+    const below = cellId(x[id], y[id] + 1)
+    const hasBedrockBelow = y[id] === GRID_HEIGHT - 1
+    const hasPackedBelow = below > 0 && kind[below] === PACKED_DIRT
+
+    if (hasBedrockBelow || hasPackedBelow) {
+      applyContactForce(id, hasPackedBelow ? below : EMPTY, 0, -downwardForce)
+      normalLoad[id] += downwardForce
+      if (hasPackedBelow) normalLoad[below] += downwardForce
+    }
+  }
+
+  const upwardForce = residualForceY[id]
+  if (upwardForce < -contactForceEpsilon && y[id] === 0) {
+    const bedrockForce = -upwardForce
+    applyContactForce(id, EMPTY, 0, bedrockForce)
+    normalLoad[id] += bedrockForce
+  }
+
+  const horizontalForce = residualForceX[id]
+  if (horizontalForce < -contactForceEpsilon && x[id] === 0) {
+    const bedrockForce = -horizontalForce
+    applyContactForce(id, EMPTY, bedrockForce, 0)
+    normalLoad[id] += bedrockForce
+  } else if (horizontalForce > contactForceEpsilon && x[id] === GRID_WIDTH - 1) {
+    applyContactForce(id, EMPTY, -horizontalForce, 0)
+    normalLoad[id] += horizontalForce
+  }
+}
+
+function spatialPackedNeighborIds(id: number, preferLeft: boolean, preferDown: boolean) {
+  const horizontal = preferLeft
+    ? [cellId(x[id] - 1, y[id]), cellId(x[id] + 1, y[id])]
+    : [cellId(x[id] + 1, y[id]), cellId(x[id] - 1, y[id])]
+  const vertical = preferDown
+    ? [cellId(x[id], y[id] + 1), cellId(x[id], y[id] - 1)]
+    : [cellId(x[id], y[id] - 1), cellId(x[id], y[id] + 1)]
+
+  return [...horizontal, ...vertical].filter((neighbor) => neighbor > 0 && kind[neighbor] === PACKED_DIRT)
+}
+
+function relaxGlueForces(id: number, preferLeft: boolean, preferDown: boolean) {
+  const fx = residualForceX[id]
+  const fy = residualForceY[id]
+  const magnitude = Math.hypot(fx, fy)
+  if (magnitude <= contactForceEpsilon) return
+
+  const neighbors = spatialPackedNeighborIds(id, preferLeft, preferDown)
+
+  let remainingNeed = magnitude
+  const unitX = -fx / magnitude
+  const unitY = -fy / magnitude
+
+  while (remainingNeed > contactForceEpsilon) {
+    const availableNeighbors = neighbors.filter((neighbor) => {
+      return glueLoad[id] < contactGlueLimitFor(id) && glueLoad[neighbor] < contactGlueLimitFor(neighbor)
+    })
+    if (availableNeighbors.length === 0) break
+
+    const share = remainingNeed / availableNeighbors.length
+    let appliedThisRound = 0
+
+    for (const neighbor of availableNeighbors) {
+      if (remainingNeed <= contactForceEpsilon) break
+
+      const ownRemaining = contactGlueLimitFor(id) - glueLoad[id]
+      const neighborRemaining = contactGlueLimitFor(neighbor) - glueLoad[neighbor]
+      const capacity = Math.min(ownRemaining, neighborRemaining, share, remainingNeed)
+      if (capacity <= 0) continue
+
+      applyContactForce(id, neighbor, unitX * capacity, unitY * capacity)
+      glueLoad[id] += capacity
+      glueLoad[neighbor] += capacity
+      remainingNeed -= capacity
+      appliedThisRound += capacity
+    }
+
+    if (appliedThisRound <= 0) break
+  }
+}
+
+function recalculateContactForces() {
+  resetPackedStressFields()
+
+  for (let id = 1; id < nextId; id += 1) {
+    if (kind[id] !== PACKED_DIRT) continue
+    residualForceY[id] = mass[id] * CONTACT_GRAVITY_FORCE
+    stress[id] = residualForceY[id]
+  }
+
+  for (let iteration = 0; iteration < contactSolverIterations; iteration += 1) {
+    for (let row = 0; row < GRID_HEIGHT; row += 1) {
+      for (let col = 0; col < GRID_WIDTH; col += 1) {
+        const id = cellId(col, row)
+        if (id > 0 && kind[id] === PACKED_DIRT) relaxNormalForces(id)
+      }
+    }
+
+    const preferLeft = iteration % 2 === 1
+    const preferDown = iteration % 4 < 2
+    const rowStart = preferDown ? GRID_HEIGHT - 1 : 0
+    const rowEnd = preferDown ? -1 : GRID_HEIGHT
+    const rowStep = preferDown ? -1 : 1
+    const colStart = preferLeft ? GRID_WIDTH - 1 : 0
+    const colEnd = preferLeft ? -1 : GRID_WIDTH
+    const colStep = preferLeft ? -1 : 1
+
+    for (let row = rowStart; row !== rowEnd; row += rowStep) {
+      for (let col = colStart; col !== colEnd; col += colStep) {
+        const id = cellId(col, row)
+        if (id > 0 && kind[id] === PACKED_DIRT) relaxGlueForces(id, preferLeft, preferDown)
+      }
+    }
+  }
+
+  for (let id = 1; id < nextId; id += 1) {
+    if (kind[id] !== PACKED_DIRT) continue
+    carriedLoad[id] = normalLoad[id]
+    stress[id] = Math.hypot(residualForceX[id], residualForceY[id]) + glueLoad[id] + normalLoad[id] * 0.12
+    verticalSupport[id] = normalLoad[id] > 0 ? 1 : 0
+    supportDistance[id] = verticalSupport[id] === 1 ? 0 : UNSUPPORTED_DISTANCE
+  }
+}
+
+function clampBreakVelocity(value: number) {
+  return Math.max(-CONTACT_MAX_BREAK_SPEED, Math.min(CONTACT_MAX_BREAK_SPEED, Math.trunc(value)))
+}
+
+function contactResidualToleranceFor(id: number) {
+  return contactForceEpsilon + strength[id] * CONTACT_RESIDUAL_STRENGTH_SCALE
+}
+
 function updatePackedStress() {
-  for (let pass = 0; pass <= MAX_STRESS_FRACTURE_REPASSES; pass += 1) {
+  if (!USE_CONTACT_FORCE_STRESS_MODEL) {
+    for (let pass = 0; pass <= maxStressFractureRepasses; pass += 1) {
+      recalculatePackedStress()
+
+      const breaks: number[] = []
+
+      for (let id = 1; id < nextId; id += 1) {
+        if (kind[id] === PACKED_DIRT && stress[id] > strength[id]) {
+          breaks.push(id)
+        }
+      }
+
+      if (breaks.length === 0) return
+
+      for (const id of breaks) {
+        if (kind[id] !== PACKED_DIRT) continue
+        setLoose(id)
+        vy[id] = Math.max(vy[id], 1)
+      }
+
+      updatePackedSupport()
+    }
+
     recalculatePackedStress()
+    return
+  }
+
+  for (let pass = 0; pass <= maxStressFractureRepasses; pass += 1) {
+    recalculateContactForces()
 
     const breaks: number[] = []
 
     for (let id = 1; id < nextId; id += 1) {
-      if (kind[id] === PACKED_DIRT && stress[id] > strength[id]) {
+      if (kind[id] !== PACKED_DIRT) continue
+      const residualMagnitude = Math.hypot(residualForceX[id], residualForceY[id])
+      if (residualMagnitude > contactResidualToleranceFor(id)) {
         breaks.push(id)
       }
     }
@@ -703,14 +959,17 @@ function updatePackedStress() {
 
     for (const id of breaks) {
       if (kind[id] !== PACKED_DIRT) continue
+      const breakVx = clampBreakVelocity(residualForceX[id] * CONTACT_BREAK_VELOCITY_SCALE)
+      const breakVy = clampBreakVelocity(residualForceY[id] * CONTACT_BREAK_VELOCITY_SCALE)
       setLoose(id)
-      vy[id] = Math.max(vy[id], 1)
+      vx[id] = breakVx
+      vy[id] = breakVy
     }
 
     updatePackedSupport()
   }
 
-  recalculatePackedStress()
+  recalculateContactForces()
 }
 
 function isPackedCell(col: number, row: number) {
@@ -967,6 +1226,43 @@ function simplifyClosedContour(contour: PackedContour, epsilon: number) {
   return simplified.length >= 3 ? simplified : contour.slice()
 }
 
+function isSimulationBoundaryPoint(point: Point) {
+  return point.x === 0 || point.x === GRID_WIDTH || point.y === 0 || point.y === GRID_HEIGHT
+}
+
+function isBoundaryContourCorner(contour: PackedContour, index: number) {
+  const point = contour[index]
+  if (!isSimulationBoundaryPoint(point)) return false
+
+  const previous = contour[(index - 1 + contour.length) % contour.length]
+  const next = contour[(index + 1) % contour.length]
+  const incomingX = point.x - previous.x
+  const incomingY = point.y - previous.y
+  const outgoingX = next.x - point.x
+  const outgoingY = next.y - point.y
+  const cross = incomingX * outgoingY - incomingY * outgoingX
+
+  return Math.abs(cross) > 0.0001
+}
+
+function removeConsecutiveDuplicatePoints(points: PackedContour) {
+  const unique: PackedContour = []
+
+  for (const point of points) {
+    const previous = unique[unique.length - 1]
+    if (previous && previous.x === point.x && previous.y === point.y) continue
+    unique.push(point)
+  }
+
+  if (unique.length > 1) {
+    const first = unique[0]
+    const last = unique[unique.length - 1]
+    if (first.x === last.x && first.y === last.y) unique.pop()
+  }
+
+  return unique
+}
+
 function smoothClosedContour(contour: PackedContour, passes: number) {
   let smoothed = contour.slice()
 
@@ -977,17 +1273,24 @@ function smoothClosedContour(contour: PackedContour, passes: number) {
     for (let i = 0; i < smoothed.length; i += 1) {
       const a = smoothed[i]
       const b = smoothed[(i + 1) % smoothed.length]
-      next.push({
-        x: a.x * 0.75 + b.x * 0.25,
-        y: a.y * 0.75 + b.y * 0.25,
-      })
-      next.push({
-        x: a.x * 0.25 + b.x * 0.75,
-        y: a.y * 0.25 + b.y * 0.75,
-      })
+      const isAProtected = isBoundaryContourCorner(smoothed, i)
+      const isBProtected = isBoundaryContourCorner(smoothed, (i + 1) % smoothed.length)
+
+      next.push(isAProtected
+        ? a
+        : {
+          x: a.x * 0.75 + b.x * 0.25,
+          y: a.y * 0.75 + b.y * 0.25,
+        })
+      next.push(isBProtected
+        ? b
+        : {
+          x: a.x * 0.25 + b.x * 0.75,
+          y: a.y * 0.25 + b.y * 0.75,
+        })
     }
 
-    smoothed = next
+    smoothed = removeConsecutiveDuplicatePoints(next)
   }
 
   return smoothed
@@ -1075,24 +1378,24 @@ function resetPhysicsVehicle() {
   })
 
   physicsLeftWheelBody = physicsWorld.createDynamicBody({
-    position: Vec2(VEHICLE_START_COL - 4.2, VEHICLE_START_ROW + 2.2),
+    position: Vec2(VEHICLE_START_COL - 4.2, VEHICLE_START_ROW + VEHICLE_WHEEL_Y_OFFSET),
     angularDamping: 0.15,
   })
   physicsLeftWheelBody.createFixture({
-    shape: Circle(1.75),
+    shape: Circle(VEHICLE_WHEEL_RADIUS),
     density: 1.35,
-    friction: 2.8,
+    friction: VEHICLE_TIRE_FRICTION,
     restitution: 0.02,
   })
 
   physicsRightWheelBody = physicsWorld.createDynamicBody({
-    position: Vec2(VEHICLE_START_COL + 4.2, VEHICLE_START_ROW + 2.2),
+    position: Vec2(VEHICLE_START_COL + 4.2, VEHICLE_START_ROW + VEHICLE_WHEEL_Y_OFFSET),
     angularDamping: 0.15,
   })
   physicsRightWheelBody.createFixture({
-    shape: Circle(1.75),
+    shape: Circle(VEHICLE_WHEEL_RADIUS),
     density: 1.35,
-    friction: 2.8,
+    friction: VEHICLE_TIRE_FRICTION,
     restitution: 0.02,
   })
 
@@ -1126,6 +1429,27 @@ function updateVehicleMotor() {
 
   physicsLeftWheelJoint?.setMotorSpeed(motorSpeed)
   physicsRightWheelJoint?.setMotorSpeed(motorSpeed)
+}
+
+function normalizeAngle(angle: number) {
+  return Math.atan2(Math.sin(angle), Math.cos(angle))
+}
+
+function flipVehicleUpright() {
+  if (!physicsChassisBody) return
+
+  const angle = normalizeAngle(physicsChassisBody.getAngle())
+  const isOnBack = Math.cos(angle) < 0
+  if (!isOnBack) return
+
+  const sideImpulse = (Math.random() * 2 - 1) * VEHICLE_FLIP_SIDE_IMPULSE
+  const chassisCenter = physicsChassisBody.getWorldCenter()
+  const rotationDirection = angle >= 0 ? -1 : 1
+
+  physicsChassisBody.applyLinearImpulse(Vec2(sideImpulse, -VEHICLE_FLIP_UPWARD_IMPULSE), chassisCenter, true)
+  physicsChassisBody.applyAngularImpulse(rotationDirection * VEHICLE_FLIP_ANGULAR_IMPULSE, true)
+  physicsLeftWheelBody?.applyLinearImpulse(Vec2(sideImpulse * 0.25, -VEHICLE_FLIP_UPWARD_IMPULSE * 0.35), physicsLeftWheelBody.getWorldCenter(), true)
+  physicsRightWheelBody?.applyLinearImpulse(Vec2(sideImpulse * 0.25, -VEHICLE_FLIP_UPWARD_IMPULSE * 0.35), physicsRightWheelBody.getWorldCenter(), true)
 }
 
 function stepPhysics(delta: number) {
@@ -1203,8 +1527,8 @@ function drawPhysicsVehicle() {
 
   ctx.save()
   drawPhysicsBox(physicsChassisBody, 5.8, 1.15, '#d9563f', '#ffe0a3')
-  drawPhysicsWheel(physicsLeftWheelBody, 1.75)
-  drawPhysicsWheel(physicsRightWheelBody, 1.75)
+  drawPhysicsWheel(physicsLeftWheelBody, VEHICLE_WHEEL_RADIUS)
+  drawPhysicsWheel(physicsRightWheelBody, VEHICLE_WHEEL_RADIUS)
   ctx.restore()
 }
 
@@ -1217,6 +1541,13 @@ function compactActiveList() {
   activeIds.length = write
 }
 
+function contactStressRatioFor(id: number) {
+  if (strength[id] <= 0) return 0
+  const glueRatio = contactGlueLimitFor(id) > 0 ? glueLoad[id] / contactGlueLimitFor(id) : 0
+  const residualRatio = Math.hypot(residualForceX[id], residualForceY[id]) / Math.max(contactResidualToleranceFor(id), 1)
+  return Math.max(glueRatio, residualRatio)
+}
+
 function simulate() {
   tick += 1
   const reverse = tick % 2 === 0
@@ -1227,7 +1558,7 @@ function simulate() {
     for (let i = 0; i < activeIds.length; i += 1) updateLooseParticle(activeIds[i])
   }
 
-  if (isStressEnabled && tick % STRESS_INTERVAL_TICKS === 0) updatePackedStress()
+  if (isStressEnabled && tick % stressIntervalTicks === 0) updatePackedStress()
   if (tick % 12 === 0) updatePackedSupport()
   if (tick % 60 === 0) compactActiveList()
 }
@@ -1242,7 +1573,7 @@ function drawGrid() {
       if (id <= 0) continue
 
       if (kind[id] === PACKED_DIRT) {
-        const stressRatio = strength[id] > 0 ? stress[id] / strength[id] : 0
+        const stressRatio = contactStressRatioFor(id)
         if (isStressEnabled && stressRatio > 0.8) {
           ctx.fillStyle = '#9f5f3f'
         } else if (isStressEnabled && stressRatio > 0.55) {
@@ -1313,12 +1644,13 @@ function updateInspector() {
     `mass: ${mass[id]}`,
     `stickiness: ${stickiness[id]}`,
     `strength: ${strength[id]}`,
-    `carried load: ${carriedLoad[id].toFixed(1)}`,
-    `stress load: ${stressLineEffectiveLoadFor(id).toFixed(1)}`,
-    `stress: ${stress[id].toFixed(1)}`,
-    `stress line: ${supportDistance[id] === UNSUPPORTED_DISTANCE ? 'none' : `${supportDistance[id]} steps`}`,
-    `next support step: ${stressLineNext[id] || 'none'}`,
-    `vertical support: ${verticalSupport[id] === 1 ? 'yes' : 'no'}`,
+    `net force: ${residualForceX[id].toFixed(1)}, ${residualForceY[id].toFixed(1)}`,
+    `net magnitude: ${Math.hypot(residualForceX[id], residualForceY[id]).toFixed(1)}`,
+    `net tolerance: ${contactResidualToleranceFor(id).toFixed(1)}`,
+    `normal load: ${normalLoad[id].toFixed(1)}`,
+    `glue used: ${glueLoad[id].toFixed(1)} / ${contactGlueLimitFor(id).toFixed(1)}`,
+    `contact stress: ${stress[id].toFixed(1)}`,
+    `bedrock/contact support: ${verticalSupport[id] === 1 ? 'yes' : 'no'}`,
     `empty below: ${hasEmptyBelow(id) ? 'yes' : 'no'}`,
     `rest ticks: ${restTicks[id]}`,
     `grounded: ${grounded[id] === 1 ? 'yes' : 'no'}`,
@@ -1415,21 +1747,65 @@ brushInput.addEventListener('input', () => {
   brushRadius = Number(brushInput.value)
 })
 
+function sliderNumber(input: HTMLInputElement) {
+  return Number(input.value)
+}
+
+function readPendingStrength() {
+  return Math.max(0, Number(strengthInput.value) || 0)
+}
+
+function applyStrengthInput() {
+  packedStrength = readPendingStrength()
+  strengthInput.value = `${packedStrength}`
+  strengthValueEl.textContent = `${packedStrength}`
+  updatePackedStrengths()
+}
+
 speedInput.addEventListener('input', () => {
   ticksPerSecond = Number(speedInput.value)
   speedValueEl.textContent = `${ticksPerSecond} ticks/s`
   simAccumulator = 0
 })
 
-dampingInput.addEventListener('input', () => {
-  globalDamping = Number(dampingInput.value) / 100
-  dampingValueEl.textContent = `${dampingInput.value}%`
+strengthInput.addEventListener('input', () => {
+  strengthValueEl.textContent = `${readPendingStrength()} pending`
 })
 
-strengthInput.addEventListener('input', () => {
-  packedStrength = Number(strengthInput.value)
-  strengthValueEl.textContent = `${packedStrength}`
-  updatePackedStrengths()
+strengthInput.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') {
+    applyStrengthInput()
+    strengthInput.blur()
+  }
+})
+
+applyStrengthButton.addEventListener('click', () => {
+  applyStrengthInput()
+})
+
+maxStressRepassesInput.addEventListener('input', () => {
+  maxStressFractureRepasses = sliderNumber(maxStressRepassesInput)
+  maxStressRepassesValueEl.textContent = `${maxStressFractureRepasses}`
+})
+
+stressIntervalInput.addEventListener('input', () => {
+  stressIntervalTicks = sliderNumber(stressIntervalInput)
+  stressIntervalValueEl.textContent = `${stressIntervalTicks}`
+})
+
+verticalSupportPackedBelowInput.addEventListener('input', () => {
+  verticalSupportPackedBelow = sliderNumber(verticalSupportPackedBelowInput)
+  verticalSupportPackedBelowValueEl.textContent = `${verticalSupportPackedBelow}`
+})
+
+contactSolverIterationsInput.addEventListener('input', () => {
+  contactSolverIterations = sliderNumber(contactSolverIterationsInput)
+  contactSolverIterationsValueEl.textContent = `${contactSolverIterations}`
+})
+
+contactForceEpsilonInput.addEventListener('input', () => {
+  contactForceEpsilon = sliderNumber(contactForceEpsilonInput)
+  contactForceEpsilonValueEl.textContent = contactForceEpsilon.toFixed(2)
 })
 
 debugInput.addEventListener('change', () => {
@@ -1445,12 +1821,11 @@ stressInput.addEventListener('change', () => {
     verticalSupport.fill(0)
     supportDistance.fill(UNSUPPORTED_DISTANCE)
     stressLineNext.fill(0)
+    residualForceX.fill(0)
+    residualForceY.fill(0)
+    glueLoad.fill(0)
+    normalLoad.fill(0)
   }
-})
-
-polygonInput.addEventListener('change', () => {
-  isPolygonDebugEnabled = polygonInput.checked
-  isPackedPolygonCacheDirty = true
 })
 
 contourInput.addEventListener('change', () => {
@@ -1461,10 +1836,13 @@ contourInput.addEventListener('change', () => {
 window.addEventListener('keydown', (event) => {
   if (event.repeat) return
   if (event.code === 'KeyA') {
-    isDrivingLeft = true
+    isDrivingRight = true
     event.preventDefault()
   } else if (event.code === 'KeyD') {
-    isDrivingRight = true
+    isDrivingLeft = true
+    event.preventDefault()
+  } else if (event.code === 'KeyW') {
+    flipVehicleUpright()
     event.preventDefault()
   } else if (event.code === 'KeyR') {
     resetPhysicsVehicle()
@@ -1474,10 +1852,10 @@ window.addEventListener('keydown', (event) => {
 
 window.addEventListener('keyup', (event) => {
   if (event.code === 'KeyA') {
-    isDrivingLeft = false
+    isDrivingRight = false
     event.preventDefault()
   } else if (event.code === 'KeyD') {
-    isDrivingRight = false
+    isDrivingLeft = false
     event.preventDefault()
   }
 })
@@ -1506,6 +1884,10 @@ clearButton.addEventListener('click', () => {
   verticalSupport.fill(0)
   supportDistance.fill(UNSUPPORTED_DISTANCE)
   stressLineNext.fill(0)
+  residualForceX.fill(0)
+  residualForceY.fill(0)
+  glueLoad.fill(0)
+  normalLoad.fill(0)
   activeIds.length = 0
   freeIds.length = 0
   nextId = 1
