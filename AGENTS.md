@@ -2,21 +2,6 @@
 
 This is a Vite + TypeScript web app for experimenting with a grid-based falling dirt cellular automata simulation. Rendering is Canvas 2D in `src/main.ts`; there is no frontend framework beyond Vite.
 
-## Commands
-
-- Install dependencies: `npm.cmd install`
-- Start dev server: `npm.cmd run dev -- --host 127.0.0.1 --port 5173`
-- Build/check: `npm.cmd run build`
-
-Use `npm.cmd` on Windows because PowerShell may block `npm.ps1`.
-
-Native Windows notes:
-
-- If Git reports dubious ownership after an environment switch, run `git config --global --add safe.directory 'C:/Users/Adam Huddleston/Desktop/dirt-lab'`.
-- This machine's nvm path is `C:\nvm4w\nodejs`; if `npm.cmd` is missing, recreate that junction to the active nvm version.
-- If nvm fails because of the space in `C:\Users\Adam Huddleston`, use the repo-local Node fallback, for example `.\.codex-node\node-v24.15.0-win-x64\npm.cmd run build`.
-- Current nvm Node is `20.18.0`; Vite 8 builds but warns that it prefers Node `20.19+` or `22.12+`.
-
 ## Current Model
 
 The grid is `180 x 110`. Particles are stored in typed arrays, and `grid` stores particle ids. Particle kinds are empty, loose dirt, and packed dirt.
