@@ -1,6 +1,6 @@
 # Project Notes
 
-This project is a Vite + TypeScript web app for experimenting with a grid-based falling dirt cellular automata simulation. Rendering is done with Canvas 2D in `src/main.ts`; there is no framework beyond Vite.
+This is a Vite + TypeScript web app for experimenting with a grid-based falling dirt cellular automata simulation. Rendering is Canvas 2D in `src/main.ts`; there is no frontend framework beyond Vite.
 
 ## Commands
 
@@ -10,89 +10,69 @@ This project is a Vite + TypeScript web app for experimenting with a grid-based 
 
 Use `npm.cmd` on Windows because PowerShell may block `npm.ps1`.
 
-## Git Branches
+Native Windows notes:
 
-- `master`: current main version with the stress-line overhang fracture model.
-- `stress-diffusion-experiment`: alternate experiment where packed dirt has diffused `support` and `stress` fields.
-- `stress-line-experiment`: experiment branch that introduced the current stress-line model, now fast-forwarded into `master`.
+- If Git reports dubious ownership after an environment switch, run `git config --global --add safe.directory 'C:/Users/Adam Huddleston/Desktop/dirt-lab'`.
+- This machine's nvm path is `C:\nvm4w\nodejs`; if `npm.cmd` is missing, recreate that junction to the active nvm version.
+- If nvm fails because of the space in `C:\Users\Adam Huddleston`, use the repo-local Node fallback, for example `.\.codex-node\node-v24.15.0-win-x64\npm.cmd run build`.
+- Current nvm Node is `20.18.0`; Vite 8 builds but warns that it prefers Node `20.19+` or `22.12+`.
 
-Useful commits:
+## Current Model
 
-- `908a55d`: initial falling dirt simulation baseline.
-- `9dfa6e5`: tuned local packed dirt stress model on `master`.
-- `fc33401`: stress-line overhang fracture model, strength slider, and stable inspector layout.
-- `aa29761`: first diffused stress/support experiment.
-- `146eddd`: tuned diffused support propagation.
-
-## Current Simulation Model On `master`
-
-The grid is `180 x 110`. Particles are stored in typed arrays, with the grid storing particle ids. Particle data includes:
-
-- `kind`: empty, loose dirt, packed dirt
-- `x`, `y`, `prevX`, `prevY`
-- `vx`, `vy`
-- `mass`, `stickiness`
-- packed dirt stress properties: `strength`, `verticalSupport`, `supportDistance`, `stressLineNext`, `carriedLoad`, `stress`
+The grid is `180 x 110`. Particles are stored in typed arrays, and `grid` stores particle ids. Particle kinds are empty, loose dirt, and packed dirt.
 
 Loose dirt:
 
 - Gravity adds integer vertical velocity.
-- Movement is axis-based, path-sampled along the grid.
-- Downward support contacts with speed 1 absorb vertical velocity instead of bouncing.
+- Movement is axis-based and path-sampled through the grid.
+- Slow downward support contacts absorb vertical velocity.
 - Higher-speed collisions use simple mass-aware momentum exchange.
-- Horizontal collisions reduce both particles' horizontal velocity toward zero.
-- Resting particles try diagonal fall into lower-left/lower-right, not flat sideways sliding.
-- Loose dirt converts to packed dirt after `PACK_AFTER_REST_TICKS`.
-- If loose dirt lands on packed dirt with a direct packed vertical column to the bottom, and cannot fall diagonally, it immediately packs.
+- Resting particles try diagonal fall before packing.
+- Loose dirt packs after `PACK_AFTER_REST_TICKS`, or immediately when resting on a stable packed column.
 
 Packed dirt:
 
-- Packed dirt is static unless broken loose.
+- Packed dirt is static until broken loose.
 - Packed dirt disconnected from the bottom-grounded packed mass becomes loose.
-- Packed dirt in direct vertical columns to the screen bottom is protected from impact-loosening.
+- Side/top wall contact does not count as grounded.
+- Direct packed columns to the bottom are protected from impact-loosening.
 
-## Current Stress Model On `master`
+## Contact-Force Fracture Model
 
-Stress fractures are toggleable in the UI.
+`master` uses the contact-force fracture model. Stress fractures are toggleable in the UI.
 
-Current tuning constants near the top of `src/main.ts`:
+Each stress pass:
 
-- `DEFAULT_PACKED_STRENGTH = 400`
-- `STRESS_LINE_LOAD_MULTIPLIER = 0.8`
-- `STRESS_LINE_CARRIED_LOAD_FACTOR = 0.08`
-- `STRESS_LINE_DISTANCE_MULTIPLIER = 0.28`
-- `STRESS_LINE_DISTANCE_EXPONENT = 1.2`
-- `STRESS_LINE_SUPPORT_BIAS = 0.65`
-- `STRESS_LINE_MAX_PATH_STEPS = GRID_WIDTH + GRID_HEIGHT`
-- `MAX_STRESS_FRACTURE_REPASSES = 3`
-- `STRESS_INTERVAL_TICKS = 4`
+1. Reset cached force fields.
+2. Give each packed particle downward weight from mass.
+3. Iteratively solve 4-neighbor contact forces.
+4. Packed neighbors can apply capped cohesive glue forces.
+5. Neighbors below, plus simulation boundaries, can apply uncapped normal forces.
+6. Boundaries do not apply cohesive glue.
+7. Glue relaxation alternates spatial sweep directions to avoid left/right bias.
+8. Packed particles break loose when unresolved net force exceeds strength-scaled residual tolerance.
 
-Every stress pass:
+Useful arrays/fields include `strength`, `residualForceX`, `residualForceY`, `glueLoad`, `normalLoad`, `carriedLoad`, `stress`, `verticalSupport`, and `grounded`.
 
-1. Reset cached stress fields.
-2. Mark `verticalSupport` particles that have a direct vertical packed-dirt column to the screen bottom.
-3. Run a multi-source BFS outward from all vertical supports through packed neighbors.
-4. Cache each overhang particle's `supportDistance` and `stressLineNext` pointer toward the nearest vertical support.
-5. Compute `carriedLoad` from vertical column mass, but only a small fraction of extra carried load contributes to stress through `STRESS_LINE_CARRIED_LOAD_FACTOR`.
-6. Each overhang deposits stress along its cached stress line. Longer paths increase total stress, and `STRESS_LINE_SUPPORT_BIAS` weights stress higher near the support end.
-7. If `stress > strength`, packed dirt converts to loose dirt. Fractures trigger immediate stress-line recalculation for up to `MAX_STRESS_FRACTURE_REPASSES` follow-up passes.
+Current tuning values near the top of `src/main.ts`:
 
-Inspector shows useful fields for the hovered particle, including velocity, mass, strength, carried load, stress load, stress, stress-line distance, next support step, vertical-support state, empty-below state, and grounded state.
+- `DEFAULT_PACKED_STRENGTH = 4000`
+- `maxStressFractureRepasses = 5`
+- `stressIntervalTicks = 1`
+- `verticalSupportPackedBelow = 0`
+- `contactSolverIterations = 18`
+- `contactForceEpsilon = 2.95`
+- `CONTACT_GRAVITY_FORCE = 4`
+- `CONTACT_GLUE_STRENGTH_SCALE = 1`
+- `CONTACT_RESIDUAL_STRENGTH_SCALE = 0.02`
+- `CONTACT_BREAK_VELOCITY_SCALE = 0.22`
+- `CONTACT_MAX_BREAK_SPEED = 5`
 
 ## UI
 
-The app has:
+The app has brush tools, brush size, simulation speed, strength with an Apply button, fracture tuning sliders, pause/step/clear, inspector, stress fracture toggle, and packed contour toggle.
 
-- Brush tools: loose dirt, packed dirt, erase
-- Brush size
-- Simulation speed
-- Global damping
-- Global packed-particle strength slider
-- Pause, step, clear
-- Inspector toggle
-- Stress fractures toggle
-
-The inspector output panel has a fixed height and scrolls internally so hovering over particles does not resize the sidebar or shift the canvas.
+The inspector shows force/debug fields for the hovered particle, including net force, net tolerance, normal load, glue used, contact stress, support state, and grounded state. The inspector panel has fixed height and scrolls internally.
 
 ## Development Notes
 
