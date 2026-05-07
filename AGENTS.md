@@ -35,9 +35,11 @@ Each stress pass:
 5. Neighbors below, plus simulation boundaries, can apply uncapped normal forces.
 6. Boundaries do not apply cohesive glue.
 7. Glue relaxation alternates spatial sweep directions to avoid left/right bias.
-8. Packed particles break loose when unresolved net force exceeds strength-scaled residual tolerance.
+8. Vertical supports seed a connected support-path crawl through packed particles.
+9. Non-vertical-support packed particles add cantilever load along their nearest path to vertical support.
+10. Packed particles break loose when unresolved net force or cantilever load exceeds strength-scaled tolerance.
 
-Useful arrays/fields include `strength`, `residualForceX`, `residualForceY`, `glueLoad`, `normalLoad`, `carriedLoad`, `stress`, `verticalSupport`, and `grounded`.
+Useful arrays/fields include `strength`, `residualForceX`, `residualForceY`, `glueLoad`, `normalLoad`, `cantileverLoad`, `carriedLoad`, `stress`, `verticalSupport`, `supportDistance`, `stressLineNext`, and `grounded`.
 
 Current tuning values near the top of `src/main.ts`:
 
@@ -50,6 +52,8 @@ Current tuning values near the top of `src/main.ts`:
 - `CONTACT_GRAVITY_FORCE = 4`
 - `CONTACT_GLUE_STRENGTH_SCALE = 1`
 - `CONTACT_RESIDUAL_STRENGTH_SCALE = 0.02`
+- `CONTACT_CANTILEVER_STRENGTH_SCALE = 0.22`
+- `CONTACT_CANTILEVER_LOAD_SCALE = 1.8`
 - `CONTACT_BREAK_VELOCITY_SCALE = 0.22`
 - `CONTACT_MAX_BREAK_SPEED = 5`
 
@@ -57,7 +61,7 @@ Current tuning values near the top of `src/main.ts`:
 
 The app has brush tools, brush size, simulation speed, strength with an Apply button, fracture tuning sliders, pause/step/clear, inspector, stress fracture toggle, and packed contour toggle.
 
-The inspector shows force/debug fields for the hovered particle, including net force, net tolerance, normal load, glue used, contact stress, support state, and grounded state. The inspector panel has fixed height and scrolls internally.
+The inspector shows force/debug fields for the hovered particle, including net force, net tolerance, normal load, glue used, cantilever load, contact stress, support state, and grounded state. The inspector panel has fixed height and scrolls internally.
 
 ## Development Notes
 

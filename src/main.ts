@@ -28,6 +28,8 @@ let contactForceEpsilon = 2.95
 const CONTACT_GRAVITY_FORCE = 4
 const CONTACT_GLUE_STRENGTH_SCALE = 1
 const CONTACT_RESIDUAL_STRENGTH_SCALE = 0.02
+const CONTACT_CANTILEVER_STRENGTH_SCALE = 0.22
+const CONTACT_CANTILEVER_LOAD_SCALE = 1.8
 const CONTACT_BREAK_VELOCITY_SCALE = 0.22
 const CONTACT_MAX_BREAK_SPEED = 5
 const USE_CONTACT_FORCE_STRESS_MODEL = true
@@ -231,6 +233,7 @@ const residualForceX = new Float32Array(MAX_PARTICLES + 1)
 const residualForceY = new Float32Array(MAX_PARTICLES + 1)
 const glueLoad = new Float32Array(MAX_PARTICLES + 1)
 const normalLoad = new Float32Array(MAX_PARTICLES + 1)
+const cantileverLoad = new Float32Array(MAX_PARTICLES + 1)
 const polygonVisited = new Uint8Array(MAX_PARTICLES)
 const activeIds: number[] = []
 const freeIds: number[] = []
@@ -320,6 +323,7 @@ function addParticle(col: number, row: number, particleKind: number) {
   residualForceY[id] = 0
   glueLoad[id] = 0
   normalLoad[id] = 0
+  cantileverLoad[id] = 0
   grid[indexAt(col, row)] = id
   activeIds.push(id)
   if (particleKind === PACKED_DIRT) {
@@ -346,6 +350,7 @@ function removeParticle(id: number) {
   residualForceY[id] = 0
   glueLoad[id] = 0
   normalLoad[id] = 0
+  cantileverLoad[id] = 0
   isPackedPolygonCacheDirty = true
   isPackedContourCacheDirty = true
   freeIds.push(id)
@@ -376,6 +381,7 @@ function setLoose(id: number) {
   residualForceY[id] = 0
   glueLoad[id] = 0
   normalLoad[id] = 0
+  cantileverLoad[id] = 0
   if (wasPacked) {
     isPackedPolygonCacheDirty = true
     isPackedContourCacheDirty = true
@@ -395,6 +401,7 @@ function setPacked(id: number) {
   residualForceY[id] = 0
   glueLoad[id] = 0
   normalLoad[id] = 0
+  cantileverLoad[id] = 0
   if (!wasPacked) {
     isPackedPolygonCacheDirty = true
     isPackedContourCacheDirty = true
@@ -649,6 +656,7 @@ function resetPackedStressFields() {
   residualForceY.fill(0)
   glueLoad.fill(0)
   normalLoad.fill(0)
+  cantileverLoad.fill(0)
 }
 
 function queueStressLineNeighbor(neighbor: number, nextIdTowardSupport: number, nextDistance: number, queue: number[]) {
@@ -863,6 +871,74 @@ function relaxGlueForces(id: number, preferLeft: boolean, preferDown: boolean) {
   }
 }
 
+function hasPackedVerticalSupport(id: number) {
+  if (y[id] >= GRID_HEIGHT - 1) return true
+  const below = cellId(x[id], y[id] + 1)
+  return below > 0 && kind[below] === PACKED_DIRT
+}
+
+function queueCantileverPathNeighbor(neighbor: number, nextIdTowardSupport: number, nextDistance: number, queue: number[]) {
+  if (neighbor <= 0 || kind[neighbor] !== PACKED_DIRT || nextDistance >= supportDistance[neighbor]) return
+  supportDistance[neighbor] = nextDistance
+  stressLineNext[neighbor] = nextIdTowardSupport
+  queue.push(neighbor)
+}
+
+function updateCantileverSupportPaths() {
+  supportDistance.fill(UNSUPPORTED_DISTANCE)
+  stressLineNext.fill(0)
+  verticalSupport.fill(0)
+
+  const queue: number[] = []
+
+  for (let id = 1; id < nextId; id += 1) {
+    if (kind[id] !== PACKED_DIRT || !hasPackedVerticalSupport(id)) continue
+    verticalSupport[id] = 1
+    supportDistance[id] = 0
+    queue.push(id)
+  }
+
+  for (let head = 0; head < queue.length; head += 1) {
+    const id = queue[head]
+    const nextDistance = supportDistance[id] + 1
+
+    queueCantileverPathNeighbor(cellId(x[id] - 1, y[id]), id, nextDistance, queue)
+    queueCantileverPathNeighbor(cellId(x[id] + 1, y[id]), id, nextDistance, queue)
+    queueCantileverPathNeighbor(cellId(x[id], y[id] - 1), id, nextDistance, queue)
+    queueCantileverPathNeighbor(cellId(x[id], y[id] + 1), id, nextDistance, queue)
+  }
+}
+
+function depositCantileverLoad(source: number) {
+  const distance = supportDistance[source]
+  if (distance === 0 || distance === UNSUPPORTED_DISTANCE) return
+
+  const sourceLoad = mass[source] * CONTACT_GRAVITY_FORCE
+  let current = source
+  let pathStep = 0
+  const maxSteps = Math.min(distance + 1, STRESS_LINE_MAX_PATH_STEPS)
+
+  while (current > 0 && pathStep < maxSteps) {
+    if (kind[current] !== PACKED_DIRT) break
+
+    const supportProgress = distance > 0 ? pathStep / distance : 1
+    cantileverLoad[current] += sourceLoad * distance * CONTACT_CANTILEVER_LOAD_SCALE * (1 + supportProgress)
+
+    if (verticalSupport[current] === 1) break
+    current = stressLineNext[current]
+    pathStep += 1
+  }
+}
+
+function accumulateCantileverLoads() {
+  cantileverLoad.fill(0)
+  updateCantileverSupportPaths()
+
+  for (let id = 1; id < nextId; id += 1) {
+    if (kind[id] === PACKED_DIRT) depositCantileverLoad(id)
+  }
+}
+
 function recalculateContactForces() {
   resetPackedStressFields()
 
@@ -897,12 +973,12 @@ function recalculateContactForces() {
     }
   }
 
+  accumulateCantileverLoads()
+
   for (let id = 1; id < nextId; id += 1) {
     if (kind[id] !== PACKED_DIRT) continue
     carriedLoad[id] = normalLoad[id]
-    stress[id] = Math.hypot(residualForceX[id], residualForceY[id]) + glueLoad[id] + normalLoad[id] * 0.12
-    verticalSupport[id] = normalLoad[id] > 0 ? 1 : 0
-    supportDistance[id] = verticalSupport[id] === 1 ? 0 : UNSUPPORTED_DISTANCE
+    stress[id] = Math.hypot(residualForceX[id], residualForceY[id]) + glueLoad[id] + cantileverLoad[id] + normalLoad[id] * 0.12
   }
 }
 
@@ -912,6 +988,10 @@ function clampBreakVelocity(value: number) {
 
 function contactResidualToleranceFor(id: number) {
   return contactForceEpsilon + strength[id] * CONTACT_RESIDUAL_STRENGTH_SCALE
+}
+
+function contactCantileverToleranceFor(id: number) {
+  return contactForceEpsilon + strength[id] * CONTACT_CANTILEVER_STRENGTH_SCALE
 }
 
 function updatePackedStress() {
@@ -950,7 +1030,7 @@ function updatePackedStress() {
     for (let id = 1; id < nextId; id += 1) {
       if (kind[id] !== PACKED_DIRT) continue
       const residualMagnitude = Math.hypot(residualForceX[id], residualForceY[id])
-      if (residualMagnitude > contactResidualToleranceFor(id)) {
+      if (residualMagnitude > contactResidualToleranceFor(id) || cantileverLoad[id] > contactCantileverToleranceFor(id)) {
         breaks.push(id)
       }
     }
@@ -963,7 +1043,7 @@ function updatePackedStress() {
       const breakVy = clampBreakVelocity(residualForceY[id] * CONTACT_BREAK_VELOCITY_SCALE)
       setLoose(id)
       vx[id] = breakVx
-      vy[id] = breakVy
+      vy[id] = breakVy !== 0 ? breakVy : cantileverLoad[id] > contactCantileverToleranceFor(id) ? 1 : 0
     }
 
     updatePackedSupport()
@@ -1545,7 +1625,8 @@ function contactStressRatioFor(id: number) {
   if (strength[id] <= 0) return 0
   const glueRatio = contactGlueLimitFor(id) > 0 ? glueLoad[id] / contactGlueLimitFor(id) : 0
   const residualRatio = Math.hypot(residualForceX[id], residualForceY[id]) / Math.max(contactResidualToleranceFor(id), 1)
-  return Math.max(glueRatio, residualRatio)
+  const cantileverRatio = cantileverLoad[id] / Math.max(contactCantileverToleranceFor(id), 1)
+  return Math.max(glueRatio, residualRatio, cantileverRatio)
 }
 
 function simulate() {
@@ -1649,6 +1730,7 @@ function updateInspector() {
     `net tolerance: ${contactResidualToleranceFor(id).toFixed(1)}`,
     `normal load: ${normalLoad[id].toFixed(1)}`,
     `glue used: ${glueLoad[id].toFixed(1)} / ${contactGlueLimitFor(id).toFixed(1)}`,
+    `cantilever load: ${cantileverLoad[id].toFixed(1)} / ${contactCantileverToleranceFor(id).toFixed(1)}`,
     `contact stress: ${stress[id].toFixed(1)}`,
     `bedrock/contact support: ${verticalSupport[id] === 1 ? 'yes' : 'no'}`,
     `empty below: ${hasEmptyBelow(id) ? 'yes' : 'no'}`,
@@ -1825,6 +1907,7 @@ stressInput.addEventListener('change', () => {
     residualForceY.fill(0)
     glueLoad.fill(0)
     normalLoad.fill(0)
+    cantileverLoad.fill(0)
   }
 })
 
@@ -1888,6 +1971,7 @@ clearButton.addEventListener('click', () => {
   residualForceY.fill(0)
   glueLoad.fill(0)
   normalLoad.fill(0)
+  cantileverLoad.fill(0)
   activeIds.length = 0
   freeIds.length = 0
   nextId = 1
